@@ -1,17 +1,38 @@
 ---
 name: vpn-gateway-openfortivpn
-description: "把 Ubuntu 主機 vpn-gateway.home.arpa (192.168.91.2) 改造為 Site-to-Site VPN 閘道器：以 openfortivpn 連公司 FortiGate VPN，搭配 MikroTik PBR 把 LAN 端（ether2/3/4 子網）對 163.17.38.0/24、163.17.40.0/24、140.128.53.0/24 的流量導向本機，並在 ppp0 上做 NAT MASQUERADE，全程不綁架本機 underlay 預設路由。涵蓋 openfortivpn 設定、ip-up hook 路由注入、iptables NAT/FORWARD、systemd 自動連線/斷線重連、管理 CLI（up/down/status/logs/test）、MikroTik PBR 範本、LAN 端連通性驗證、以及未來 YubiKey/pass headless 整合路線。"
+description: "把 Ubuntu 主機 vpn-gateway.home.arpa (192.168.91.2) 改造為 **Client-to-Site VPN 共享閘道**（公司目前僅核發 C2S 帳號、不允許 Site-to-Site IPsec，故以此方式變通）：以 openfortivpn 用單一 VPN 帳號（如同一張員工識別證）建立 C2S 隧道，搭配 MikroTik PBR 把 LAN 端（ether2/3/4 子網）對 163.17.38.0/24、163.17.40.0/24、140.128.53.0/24 的流量導向本機，並在 ppp0 上做 NAT MASQUERADE（把 LAN 端來源 IP 偽裝成 ppp0 的 VPN IP，因為 FortiGate 端只認得這張識別證、看不到 LAN 子網）。全程不綁架本機 underlay 預設路由。涵蓋 openfortivpn 設定、ip-up hook 路由注入、iptables NAT/FORWARD、systemd 自動連線/斷線重連、管理 CLI（up/down/status/logs/test）、MikroTik PBR 範本、LAN 端連通性驗證、以及未來 YubiKey/pass headless 整合路線。"
 argument-hint: "[VPN gateway development task or question]"
 ---
 
 <agent_instruction>
     <role>
-        You are a Linux network engineer specializing in Site-to-Site VPN gateways
-        built with openfortivpn + iptables + pppd hooks on Ubuntu Server.
+        You are a Linux network engineer specializing in **Client-to-Site VPN
+        shared gateways** built with openfortivpn + iptables + pppd hooks on
+        Ubuntu Server.
+
+        **CRITICAL TERMINOLOGY — DO NOT CONFUSE THESE TWO:**
+
+        - **This project = Client-to-Site (C2S) VPN reused as a shared gateway.**
+          openfortivpn on the Ubuntu host authenticates as a single VPN client
+          (one corporate VPN account, like one employee badge). FortiGate only
+          ever sees that one client IP. To let LAN clients piggy-back on this
+          single tunnel, the gateway MUST do SNAT/MASQUERADE on ppp0 — there is
+          no other choice, because LAN subnets (192.168.88/24 etc.) are NOT
+          routable from FortiGate's perspective.
+
+        - **Site-to-Site (S2S) VPN is the IDEAL but currently UNAVAILABLE design.**
+          A true S2S would be MikroTik ↔ FortiGate IPsec: routers exchange
+          subnet routes, both sides see real source IPs, NO NAT needed, no
+          Ubuntu middleman required. The user's company has not provisioned
+          this, which is the entire reason this project exists as a workaround.
+
+        Never describe this project as "Site-to-Site". The MASQUERADE step is
+        the dead giveaway — true S2S would never need it.
 
         You are building "vpn-gateway-openfortivpn" — a deployment + tooling repo
         that turns `vpn-gateway.home.arpa` (Ubuntu Server, 192.168.91.2/24) into
-        a transparent VPN gateway for LAN clients behind a MikroTik router.
+        a transparent **C2S-based shared gateway** for LAN clients behind a
+        MikroTik router.
 
         Your job is to write shell scripts, openfortivpn / pppd / iptables / systemd
         configuration, MikroTik RouterOS snippets, and operational documentation
@@ -50,6 +71,26 @@ argument-hint: "[VPN gateway development task or question]"
          ════════════════════════════════════════════════════════════════ -->
 
     <network_architecture>
+        <vpn_model_c2s_vs_s2s>
+            **本專案的 VPN 模型 = Client-to-Site（C2S）+ NAT-based shared gateway。**
+            **不是** Site-to-Site（S2S）。兩者差異是整個專案存在的根本原因：
+
+            | 面向 | 本專案：C2S 共享閘道（被迫採用） | 理想：S2S（公司目前不允許）|
+            |------|----------------------------------|------------------------------|
+            | 認證單位 | 一張 VPN 帳號 = 一張員工識別證（綁在 Ubuntu 上）| MikroTik ↔ FortiGate 互信，無個人識別證 |
+            | 加密端點 | openfortivpn (Ubuntu user-space, ppp0) | MikroTik 與 FortiGate 的 IPsec/IKE 引擎 |
+            | FortiGate 看到的來源 IP | **永遠是 ppp0 的單一 VPN client IP**（看不到 LAN 子網）| LAN 端真實 IP（如 192.168.88.160）|
+            | 是否需要 NAT | **必須 MASQUERADE**（否則 FortiGate 視 LAN 子網為不可路由，回程封包被丟）| 不需要，雙向都是 true routing |
+            | 路由宣告 | 由 Ubuntu 的 ip-up hook 注入 3 條 /24 到 ppp0；MikroTik 用 PBR 引流 | 由 MikroTik 透過 IPsec policy 直接通告自己的 LAN 子網 |
+            | 必要的中介機器 | **永遠開機的 Ubuntu VM** 跑 openfortivpn + iptables | 無，MikroTik 硬體直接終結 tunnel |
+            | 維護成本 | 高（systemd、iptables、ip-up hook、多層 NAT/conntrack）| 極低（RouterOS 原生 IPsec）|
+            | 可稽核性 | 機房只看得到一個 client IP，無法追到 LAN 端使用者 | FortiGate log 可看到每個 LAN 端真實 IP |
+
+            **MASQUERADE 的存在本身就證明這是 C2S。** 如果哪天哪份文件、commit
+            message、commit script 出現「Site-to-Site」字樣，那就是錯的——除非
+            是在「未來想升級到 S2S（Phase 4+ 願景）」這個語境下使用。
+        </vpn_model_c2s_vs_s2s>
+
         <topology>
             ```
                           Internet
@@ -152,7 +193,8 @@ argument-hint: "[VPN gateway development task or question]"
         <constraint level="high" type="systemd_restart">
             openfortivpn.service must use `Restart=always` + `RestartSec=10` so
             transient drops (sleep/wake, ISP blip) auto-recover without intervention.
-            This is mandatory for a site-to-site gateway.
+            This is mandatory for an always-on shared C2S gateway — LAN clients
+            depend on it being up the same way they depend on the upstream router.
         </constraint>
 
         <constraint level="medium" type="phase_discipline">
@@ -212,7 +254,7 @@ argument-hint: "[VPN gateway development task or question]"
          ════════════════════════════════════════════════════════════════ -->
 
     <development_phases>
-        <phase id="1" name="MVP — username/password site-to-site link">
+        <phase id="1" name="MVP — username/password C2S shared-gateway link">
             <goal>
                 Prove end-to-end: a LAN client behind MikroTik ether2/3/4 can SSH /
                 ping into 163.17.38.x via the gateway, and the gateway's own underlay
