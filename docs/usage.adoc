@@ -1,0 +1,230 @@
+= vpn-gateway-openfortivpn — 使用手冊
+:toc: left
+:toclevels: 3
+:sectnums:
+
+本手冊說明如何在 `vpn-gateway.home.arpa`（Ubuntu Server，`192.168.91.2/24`）上，
+使用本 repo 提供的腳本與設定檔，把該主機部署為
+**Client-to-Site VPN 共享閘道**。
+
+設計背景請見 `architecture.adoc`；AI 開發助手用的規範請見
+`.github/skills/vpn-gateway-openfortivpn/SKILL.md`。
+
+== 0. 前置條件
+
+* OS：Ubuntu Server 22.04 / 24.04（其他 systemd-based distro 應可比照）
+* 帳號：可 `sudo` 的使用者
+* 網路：
+** 預設路由（`ip route show default`）指向 LAN 邊界路由器
+   （在本部署為 MikroTik `192.168.91.1`）
+** 該預設路由可正常連到公司 FortiGate VPN gateway 的 TCP/443
+* 已從公司 FortiGate 管理員取得：
+** VPN host / port
+** 帳號 / 密碼（**單一 C2S 帳號**，整台 gateway 共用此一身份）
+** SSL 憑證的 SHA-256 fingerprint（`trusted-cert`，第一次連線錯誤訊息中會列出）
+
+== 1. 腳本與設定檔角色一覽
+
+[cols="1,3"]
+|===
+| 路徑 | 角色
+
+| `scripts/01-install.sh`
+| 安裝 `openfortivpn`、`ppp`、`iptables-persistent` 等套件，
+  並啟用 `netfilter-persistent.service`。
+
+| `scripts/02-enable-ip-forward.sh`
+| 寫入 `/etc/sysctl.d/99-vpn-gateway.conf`：開 `ip_forward=1`、
+  關 `accept_redirects`、`rp_filter=2`（loose mode，容許非對稱路由）。
+
+| `scripts/03-setup-iptables.sh`
+| 自動偵測 LAN 介面（從 default route 取），加上：
+  `nat POSTROUTING -o ppp0 MASQUERADE`、
+  `FORWARD LAN→ppp0 ACCEPT`、
+  `FORWARD ppp0→LAN RELATED,ESTABLISHED ACCEPT`，
+  並 `iptables-save` 到 `/etc/iptables/rules.v4`。
+
+| `scripts/ppp-ip-up.sh`
+| 安裝為 `/etc/ppp/ip-up.d/00-vpn-gateway-routes`。pppd 在 ppp0 起來後
+  自動呼叫，把 3 條公司 `/24`（163.17.38、163.17.40、140.128.53）注入
+  `ip route ... dev ppp0`。日誌 `/var/log/vpn-gateway-routes.log`。
+
+| `scripts/99-verify.sh`
+| 健診：套件、sysctl、設定檔、ip-up hook、systemd、ppp0 介面、
+  公司網段路由、預設路由是否被綁架、iptables NAT 規則。
+  可重複執行，不會改變狀態。
+
+| `config/openfortivpn.conf.example`
+| `/etc/openfortivpn/config` 範本。重點：
+  `set-routes=0` / `set-dns=0` / `pppd-use-peerdns=0` 全關。
+
+| `systemd/openfortivpn.service`
+| `/etc/systemd/system/openfortivpn.service` 範本。
+  `Restart=always` + `RestartSec=10`，保證自動重連。
+|===
+
+NOTE: 所有腳本都是 `set -euo pipefail` + 檢查 `EUID==0`，重複執行皆 idempotent。
+
+== 2. 標準部署流程（首次安裝）
+
+在 `vpn-gateway.home.arpa` 上以可 `sudo` 的帳號執行：
+
+[source,bash]
+----
+git clone https://github.com/jojo-echoes/vpn-gateway-openfortivpn.git
+cd vpn-gateway-openfortivpn
+
+# 1) 安裝套件
+sudo bash scripts/01-install.sh
+
+# 2) 建立 openfortivpn 設定（請填入公司 FortiGate 資訊）
+sudo install -d -m 0750 /etc/openfortivpn
+sudo cp config/openfortivpn.conf.example /etc/openfortivpn/config
+sudo chmod 0600 /etc/openfortivpn/config
+sudo chown root:root /etc/openfortivpn/config
+sudoedit /etc/openfortivpn/config        # 填 host / port / username / password / trusted-cert
+
+# 3) 啟用 IPv4 forwarding 與 sysctl 安全參數
+sudo bash scripts/02-enable-ip-forward.sh
+
+# 4) 安裝 ppp ip-up hook（VPN 上線時自動補 3 條 /24 路由）
+sudo install -m 0755 scripts/ppp-ip-up.sh \
+    /etc/ppp/ip-up.d/00-vpn-gateway-routes
+
+# 5) 設定 iptables（NAT MASQUERADE on ppp0 + FORWARD）
+sudo bash scripts/03-setup-iptables.sh
+
+# 6) 安裝並啟用 systemd 服務
+sudo cp systemd/openfortivpn.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now openfortivpn.service
+
+# 7) 健診
+sudo bash scripts/99-verify.sh
+----
+
+預期 `99-verify.sh` 全部 ✓ 或僅在尚未撥上 VPN 時對 `ppp0`/路由項目顯示 ⚠。
+
+== 3. 取得 trusted-cert fingerprint（第一次安裝必做）
+
+`/etc/openfortivpn/config` 範本中 `trusted-cert` 預填 64 個 0，**必須換成
+真正的 SHA-256 fingerprint**，否則 openfortivpn 會在 TLS 階段拒絕連線。
+
+互動式取得方式：
+
+[source,bash]
+----
+sudo systemctl stop openfortivpn.service
+sudo openfortivpn -c /etc/openfortivpn/config
+# 第一次連線會印出類似：
+#   Gateway certificate validation failed.
+#   Gateway certificate:
+#       subject:  ...
+#       sha256:   ABCD...EF (64 hex chars)
+# 把那串 64 個 hex 字元複製到 config 的 trusted-cert= 後
+sudo systemctl start openfortivpn.service
+----
+
+== 4. 日常運維
+
+=== 4.1 常用指令
+
+[cols="1,2"]
+|===
+| 動作 | 指令
+
+| 看 VPN 是否撥上     | `sudo bash scripts/99-verify.sh`
+| 看即時連線日誌      | `journalctl -u openfortivpn -f`
+| 強制重撥            | `sudo systemctl restart openfortivpn.service`
+| 暫時停 VPN          | `sudo systemctl stop openfortivpn.service`
+| 永久停 VPN          | `sudo systemctl disable --now openfortivpn.service`
+| 看 ppp0 IP          | `ip -4 addr show ppp0`
+| 看公司網段路由      | `ip route \| grep ppp0`
+| 看 NAT 計數         | `sudo iptables -t nat -nvL POSTROUTING`
+| 看 ip-up hook 日誌  | `sudo tail -f /var/log/vpn-gateway-routes.log`
+|===
+
+=== 4.2 修改公司網段（要新增/移除 /24）
+
+編輯 `/etc/ppp/ip-up.d/00-vpn-gateway-routes` 裡的 `ROUTES=( ... )` 陣列，
+然後 `sudo systemctl restart openfortivpn.service` 觸發 ppp0 重建即可。
+（同步也要請 MikroTik 那端的 PBR 跟著加 / 減，否則 LAN 端流量根本不會
+被導到 gateway。）
+
+=== 4.3 LAN 端連通性驗證
+
+從 LAN client（如 `192.168.88.x`）：
+
+[source,bash]
+----
+# 1) 路由是否到 gateway
+traceroute -n 163.17.38.1            # 第一跳應為 MikroTik，第二跳為 192.168.91.2
+# 2) 實際連通
+ping -c3 163.17.38.1
+ssh user@163.17.38.x
+----
+
+同一時間在 gateway 上：
+
+[source,bash]
+----
+sudo iptables -t nat -nvL POSTROUTING   # MASQUERADE 行的 pkts 應遞增
+sudo conntrack -L | grep 163.17.38      # 看到 LAN client → 公司 IP 的 conntrack
+----
+
+== 5. 故障排除
+
+[cols="2,3"]
+|===
+| 症狀 | 處置
+
+| `99-verify.sh` 在「預設路由」一欄爆紅
+  （default 跑到 ppp0）
+| `set-routes=0` 沒生效。檢查 `/etc/openfortivpn/config`，
+  必要時 `sudo systemctl restart openfortivpn.service`。
+
+| ppp0 起得來但公司網段沒路由
+| `/etc/ppp/ip-up.d/00-vpn-gateway-routes` 不存在或不可執行 →
+  重跑步驟 4。看 `/var/log/vpn-gateway-routes.log`。
+
+| LAN client 連得到 `192.168.91.2` 但連不到公司 IP
+| (a) MikroTik PBR 沒下 → MikroTik 端設定問題；
+  (b) `iptables -t nat -nvL POSTROUTING` 計數沒動 → 重跑 `03-setup-iptables.sh`；
+  (c) FortiGate 那邊把該帳號擋了。
+
+| `journalctl -u openfortivpn` 顯示 `Gateway certificate validation failed`
+| `trusted-cert` 過期或填錯。重做第 3 節。
+
+| systemd 反覆 Restart
+| 通常是帳密 / fingerprint / FortiGate 端設定問題。
+  `journalctl -u openfortivpn -e` 看最後一段錯誤碼。
+|===
+
+== 6. 解除安裝
+
+[source,bash]
+----
+sudo systemctl disable --now openfortivpn.service
+sudo rm /etc/systemd/system/openfortivpn.service
+sudo systemctl daemon-reload
+
+sudo rm /etc/ppp/ip-up.d/00-vpn-gateway-routes
+sudo rm -rf /etc/openfortivpn
+
+# 還原 iptables（謹慎；下行會清掉所有規則）
+sudo iptables -t nat -F POSTROUTING
+sudo iptables -F FORWARD
+sudo iptables-save > /etc/iptables/rules.v4
+
+sudo rm /etc/sysctl.d/99-vpn-gateway.conf
+sudo sysctl --system
+----
+
+== 7. 安全注意事項
+
+* `/etc/openfortivpn/config` 內含明碼密碼，務必 `chmod 0600 root:root`。
+* 本 gateway 是「**整個 LAN 子網共用一張 VPN 帳號**」的設計；
+  FortiGate 那端只看得到 ppp0 的單一 client IP，**無法稽核到 LAN 端真實使用者**。
+  如果公司有合規要求要追到個人，請改用 S2S 或 per-user VPN，本架構不適用。
+* `Restart=always`：開機後若 VPN 撥不上會無限重試，會在 FortiGate
+  log 留下大量失敗紀錄，請與管理員協調節流策略。

@@ -1,10 +1,17 @@
 # vpn-gateway-openfortivpn
 
 將一台 Linux 主機（例：`vpn-gateway.home.arpa`，IP `192.168.91.2/24`）改造成
-**LAN-to-LAN / Site-to-Site VPN 閘道器**：以 [`openfortivpn`](https://github.com/adrienverge/openfortivpn)
-連線至公司 FortiGate VPN，對 LAN 端來自其他子網（如 `192.168.88.0/24`、`192.168.90.0/24`）
-且目的地為公司網段（`163.17.38.0/24`、`163.17.40.0/24`、`140.128.53.0/24`）的流量
-執行 **NAT (MASQUERADE)** 並由 `ppp0` 隧道轉送，**且不綁架本機原本的預設閘道**。
+**Client-to-Site VPN 共享閘道**：以 [`openfortivpn`](https://github.com/adrienverge/openfortivpn)
+用**單一 C2S 帳號**連線至公司 FortiGate SSL VPN，對 LAN 端來自其他子網
+（如 `192.168.88.0/24`、`192.168.90.0/24`）且目的地為公司網段
+（`163.17.38.0/24`、`163.17.40.0/24`、`140.128.53.0/24`）的流量執行
+**NAT (MASQUERADE)** 並由 `ppp0` 隧道轉送，**且不綁架本機原本的預設閘道**。
+
+> **為什麼是 C2S 而不是 Site-to-Site？** S2S（MikroTik ↔ FortiGate IPsec）才是
+> 理想設計——雙向 true routing、不需 NAT、可稽核 LAN 端真實 IP——但公司目前
+> **僅核發 C2S 帳號**，所以只能以這台 Ubuntu 跑 openfortivpn 當「人肉 IPsec 閘道」
+> 的方式變通。`ppp0` 上的 `MASQUERADE` 就是 C2S 的鐵證：S2S 永遠不需要它。
+> 詳見 `docs/architecture.adoc` 與 `.github/skills/vpn-gateway-openfortivpn/SKILL.md`。
 
 ---
 

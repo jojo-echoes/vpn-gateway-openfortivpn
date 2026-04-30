@@ -6,8 +6,20 @@
 == 目標
 
 把 `vpn-gateway.home.arpa`（Ubuntu Server，IP `192.168.91.2/24`）改造為
-**Site-to-Site VPN 閘道器**，讓 LAN 端其他主機透過它把流量送進公司
-FortiGate VPN，但**不影響該主機自身的對外網路（underlay）**。
+**Client-to-Site VPN 共享閘道**，讓 LAN 端其他主機透過它，以一張公司
+核發的 C2S VPN 帳號為共用身份，把流量送進公司 FortiGate VPN，
+但**不影響該主機自身的對外網路（underlay）**。
+
+[NOTE]
+====
+本專案**不是** Site-to-Site VPN。理想的 S2S 應為 MikroTik ↔ FortiGate
+IPsec：兩端互通子網、雙方看到真實來源 IP、**完全不需要 NAT**。
+公司目前未提供 S2S，所以才以這台 Ubuntu 跑 openfortivpn + iptables
+MASQUERADE 來變通（C2S + SNAT 共享閘道）。
+
+`ppp0` 上的 `MASQUERADE` 就是 C2S 的鐵證——若哪天升級成 S2S，
+這條規則和整台 Ubuntu 中介機都應該被拿掉。
+====
 
 == Underlay vs Overlay
 

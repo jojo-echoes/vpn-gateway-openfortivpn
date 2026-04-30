@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenFortiVPN site-to-site tunnel
+Description=OpenFortiVPN Client-to-Site shared gateway tunnel
 Documentation=https://github.com/jojo-echoes/vpn-gateway-openfortivpn
 After=network-online.target
 Wants=network-online.target
