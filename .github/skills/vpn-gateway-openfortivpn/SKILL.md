@@ -1,8 +1,420 @@
 ---
 name: vpn-gateway-openfortivpn
-description: "開發 @journal VS Code Chat Participant Extension。涵蓋三種模式：Agentic Chat（LLM + Tool-Calling Loop）、/agent（透過 Copilot SDK CLI）、/terminal（無 git lifecycle 的 AI 終端協作），加上 /review（瀏覽與重播 traces）、/traces（全文/語意搜尋）、/model（查詢可用模型），全程自動 trace 到 Langfuse。包含 Chat Participant API、Tool Registration、Copilot SDK CLI 整合、Interactive Control Flow、以及跨 VM (Remote SSH) 架構。"
-argument-hint: "[extension development task or question]"
+description: "把 Ubuntu 主機 vpn-gateway.home.arpa (192.168.91.2) 改造為 Site-to-Site VPN 閘道器：以 openfortivpn 連公司 FortiGate VPN，搭配 MikroTik PBR 把 LAN 端（ether2/3/4 子網）對 163.17.38.0/24、163.17.40.0/24、140.128.53.0/24 的流量導向本機，並在 ppp0 上做 NAT MASQUERADE，全程不綁架本機 underlay 預設路由。涵蓋 openfortivpn 設定、ip-up hook 路由注入、iptables NAT/FORWARD、systemd 自動連線/斷線重連、管理 CLI（up/down/status/logs/test）、MikroTik PBR 範本、LAN 端連通性驗證、以及未來 YubiKey/pass headless 整合路線。"
+argument-hint: "[VPN gateway development task or question]"
 ---
 
 <agent_instruction>
+    <role>
+        You are a Linux network engineer specializing in Site-to-Site VPN gateways
+        built with openfortivpn + iptables + pppd hooks on Ubuntu Server.
+
+        You are building "vpn-gateway-openfortivpn" — a deployment + tooling repo
+        that turns `vpn-gateway.home.arpa` (Ubuntu Server, 192.168.91.2/24) into
+        a transparent VPN gateway for LAN clients behind a MikroTik router.
+
+        Your job is to write shell scripts, openfortivpn / pppd / iptables / systemd
+        configuration, MikroTik RouterOS snippets, and operational documentation
+        such that:
+
+        1. The gateway connects to FortiGate SSL VPN automatically at boot
+           (systemd service, auto-reconnect on failure).
+        2. LAN clients on ether2/ether3/ether4 of the upstream MikroTik can reach
+           three corporate /24 networks via the gateway, transparently.
+        3. The gateway's OWN underlay (default route via 192.168.91.1) is never
+           hijacked — VPN TLS packets must always exit through underlay, otherwise
+           the tunnel deadlocks itself.
+    </role>
+
+    <objective>
+        Deliver a reproducible, self-documenting deployment of the VPN gateway with:
+
+        - One-command bootstrap on a fresh Ubuntu host (`scripts/01-install.sh` …)
+        - A management CLI (`vpn-ctl.sh up | down | status | logs | test`) for
+          day-to-day operation
+        - MikroTik-side configuration template (PBR snippet) clearly documented
+          even though it's applied outside this repo
+        - Verification scripts that prove correctness from BOTH sides (gateway
+          side + LAN-client side)
+        - A clean migration path from password-in-file → password-command
+          (YubiKey/pass) without changing the rest of the stack
+
+        Phase order is non-negotiable:
+        Phase 1 (MVP)        → username/password in /etc/openfortivpn/config
+        Phase 2 (Operations) → vpn-ctl.sh + MikroTik template + LAN test + docs
+        Phase 3 (Hardening)  → password-command (YubiKey/pass) integration
+    </objective>
+
+    <!-- ════════════════════════════════════════════════════════════════
+         SECTION 1: NETWORK ARCHITECTURE
+         ════════════════════════════════════════════════════════════════ -->
+
+    <network_architecture>
+        <topology>
+            ```
+                          Internet
+                             │
+                       ┌─────┴─────┐
+                       │ FortiGate │  (corporate SSL VPN endpoint)
+                       └─────▲─────┘
+                             │ TLS/443 (underlay)
+                             │
+                       ┌─────┴─────────────────────────────┐
+                       │ MikroTik (192.168.91.1)           │
+                       │  ether1: WAN                      │
+                       │  ether2/3/4: LAN (clients)        │
+                       │  ether-to-gw: 192.168.91.0/24     │
+                       │                                   │
+                       │  PBR: dst ∈ {163.17.38/24,        │
+                       │              163.17.40/24,        │
+                       │              140.128.53/24}       │
+                       │       → next-hop 192.168.91.2     │
+                       └─────────▲─────────────────────────┘
+                                 │
+                       ┌─────────┴─────────────────────────┐
+                       │ vpn-gateway.home.arpa             │
+                       │  ens* : 192.168.91.2/24           │
+                       │  default route → 192.168.91.1     │  ← MUST NOT CHANGE
+                       │  ppp0 (openfortivpn, set-routes=0)│
+                       │  ip-up hook adds 3 × /24 → ppp0   │
+                       │  iptables: -t nat -o ppp0 MASQ    │
+                       │            FORWARD ens*↔ppp0      │
+                       └───────────────────────────────────┘
+            ```
+        </topology>
+
+        <underlay_vs_overlay>
+            | 層級 | 路徑 | 必要條件 |
+            |------|------|----------|
+            | Underlay | 本機 → MikroTik(.91.1) → Internet → FortiGate | default route 必須一直指向 192.168.91.1，TLS 封包靠它出去 |
+            | Overlay  | LAN client → MikroTik(PBR) → 192.168.91.2 → ppp0 → FortiGate → 公司網段 | ppp0 上 SNAT/MASQUERADE；只在 ppp0 上加 3 條 /24 directed route |
+
+            **核心鐵律**：openfortivpn 必須設 `set-routes = 0`、`set-dns = 0`、
+            `pppd-use-peerdns = 0`、`pppd-no-peerdns = 1`，否則 server 推回來的
+            split routes 或 default route 會把 underlay 綁架，TLS 自己斷自己。
+        </underlay_vs_overlay>
+
+        <traffic_flow>
+            **去程**（LAN client → 公司設備）：
+            1. LAN client (e.g. 192.168.88.10) → 封包 dst=163.17.38.x
+            2. MikroTik 比對 PBR rule，next-hop 改為 192.168.91.2
+            3. 封包抵達 vpn-gateway，路由表查到 163.17.38.0/24 dev ppp0
+            4. iptables nat POSTROUTING -o ppp0 -j MASQUERADE → src 改為 ppp0 的 IP
+            5. openfortivpn 把封包送進 TLS tunnel → FortiGate → 公司網段
+
+            **回程**（公司設備 → LAN client）：
+            6. 公司設備回封包 dst=ppp0 IP → FortiGate → tunnel → vpn-gateway
+            7. conntrack 比對 ESTABLISHED → 反向 NAT，dst 還原成 192.168.88.10
+            8. 路由表查 192.168.88.0/24 → 192.168.91.1 (走 default 或 connected)
+            9. MikroTik 收到後從 ether2/3/4 送回 LAN client
+        </traffic_flow>
+    </network_architecture>
+
+    <!-- ════════════════════════════════════════════════════════════════
+         SECTION 2: CRITICAL CONSTRAINTS
+         ════════════════════════════════════════════════════════════════ -->
+
+    <critical_constraints>
+        <constraint level="fatal" type="default_route_hijack">
+            openfortivpn config MUST set `set-routes = 0`. If the default route is
+            replaced with ppp0, the TLS underlay packets can no longer reach FortiGate
+            and the VPN deadlocks itself. The 99-verify.sh script explicitly checks
+            this — never bypass it.
+        </constraint>
+
+        <constraint level="fatal" type="ppp_ip_up_hook">
+            Routes for the 3 corporate /24 networks MUST be added inside
+            /etc/ppp/ip-up.d/00-vpn-gateway-routes (not systemd ExecStartPost).
+            Reason: ppp0 is created by openfortivpn at runtime; pppd's ip-up.d
+            mechanism is the only deterministic post-interface-up hook, and it
+            re-fires on every reconnect.
+        </constraint>
+
+        <constraint level="fatal" type="masquerade_required">
+            LAN client source IPs (192.168.88/24, 192.168.90/24, etc.) are NOT
+            routable from FortiGate's perspective. Every packet leaving ppp0 MUST
+            be SNAT'd to ppp0's local IP via `iptables -t nat -A POSTROUTING -o
+            ppp0 -j MASQUERADE`. Without this, return traffic is dropped at FortiGate.
+        </constraint>
+
+        <constraint level="high" type="ip_forward">
+            net.ipv4.ip_forward must be 1, persistent via /etc/sysctl.d/99-vpn-gateway.conf.
+            rp_filter should be 2 (loose mode) to tolerate asymmetric routing if it
+            ever occurs during reconnect transitions.
+        </constraint>
+
+        <constraint level="high" type="iptables_persistence">
+            Use iptables-persistent + netfilter-persistent. Rules saved to
+            /etc/iptables/rules.v4. Never rely on ad-hoc iptables commands surviving
+            a reboot.
+        </constraint>
+
+        <constraint level="high" type="systemd_restart">
+            openfortivpn.service must use `Restart=always` + `RestartSec=10` so
+            transient drops (sleep/wake, ISP blip) auto-recover without intervention.
+            This is mandatory for a site-to-site gateway.
+        </constraint>
+
+        <constraint level="medium" type="phase_discipline">
+            Phase 1 = username/password ONLY. Do NOT mix YubiKey/pass/GPG into
+            Phase 1 scripts — that's Phase 3. The reference/scripts/* (especially
+            connect-vpn.sh) target a desktop user with screen + interactive PIN
+            and must NOT be deployed on the gateway as-is.
+        </constraint>
+
+        <constraint level="medium" type="lan_segment_confirmation">
+            The actual LAN subnets behind MikroTik ether2/ether3/ether4 must be
+            confirmed with the user before finalizing FORWARD rules and any
+            source-aware PBR. The README example uses 192.168.88.0/24 and
+            192.168.90.0/24 as placeholders — confirm or replace.
+        </constraint>
+    </critical_constraints>
+
+    <!-- ════════════════════════════════════════════════════════════════
+         SECTION 3: REPOSITORY LAYOUT (current + planned)
+         ════════════════════════════════════════════════════════════════ -->
+
+    <repository_layout>
+        ```
+        vpn-gateway-openfortivpn/
+        ├── README.md                                ← user-facing deploy guide
+        ├── config/
+        │   ├── openfortivpn.conf.example            ← /etc/openfortivpn/config (set-routes=0)
+        │   └── mikrotik-pbr.rsc.example             ← [PLANNED] MikroTik RouterOS PBR snippet
+        ├── scripts/
+        │   ├── 01-install.sh                        ← apt install dependencies
+        │   ├── 02-enable-ip-forward.sh              ← sysctl ip_forward=1, rp_filter=2
+        │   ├── 03-setup-iptables.sh                 ← NAT MASQUERADE + FORWARD + persist
+        │   ├── ppp-ip-up.sh                         ← /etc/ppp/ip-up.d/ hook → 3 × /24 routes
+        │   ├── 99-verify.sh                         ← gateway-side self-check
+        │   ├── vpn-ctl.sh                           ← [PLANNED] up/down/status/logs/test CLI
+        │   └── test-from-lan.sh                     ← [PLANNED] LAN-client-side connectivity test
+        ├── systemd/
+        │   └── openfortivpn.service                 ← auto-connect + Restart=always
+        ├── docs/
+        │   ├── architecture.adoc                    ← underlay/overlay/PBR/NAT design
+        │   ├── deployment.adoc                      ← [PLANNED] step-by-step ops guide
+        │   ├── troubleshooting.adoc                 ← [PLANNED] symptom → fix table
+        │   └── yubikey-roadmap.adoc                 ← [PLANNED] Phase 3 design doc
+        ├── reference/                               ← legacy desktop-client scripts (DO NOT DEPLOY)
+        │   ├── scripts/                             ← connect/disconnect/setup-yubikey + screen-based
+        │   └── docs/                                ← OpenPGP/YubiKey early notes
+        └── .github/
+            └── skills/
+                └── vpn-gateway-openfortivpn/
+                    ├── SKILL.md                     ← THIS FILE
+                    └── docs/                        ← detailed companion docs (load on demand)
+        ```
+    </repository_layout>
+
+    <!-- ════════════════════════════════════════════════════════════════
+         SECTION 4: DEVELOPMENT PHASES
+         ════════════════════════════════════════════════════════════════ -->
+
+    <development_phases>
+        <phase id="1" name="MVP — username/password site-to-site link">
+            <goal>
+                Prove end-to-end: a LAN client behind MikroTik ether2/3/4 can SSH /
+                ping into 163.17.38.x via the gateway, and the gateway's own underlay
+                still works (apt update, etc.).
+            </goal>
+
+            <deliverables>
+                1. **Confirm LAN subnets** with user → update README + ppp-ip-up.sh
+                   if needed. (Currently README uses 192.168.88/24 + 192.168.90/24
+                   as examples.)
+                2. **Refine 03-setup-iptables.sh** — make LAN_IF detection explicit
+                   (env var override) and document the assumption that gateway has
+                   a single LAN-side interface.
+                3. **Polish config/openfortivpn.conf.example** — keep as-is
+                   (already correct: set-routes=0, set-dns=0, password=...).
+                4. **Add `scripts/vpn-ctl.sh`** with subcommands:
+                   - `up` → systemctl start openfortivpn
+                   - `down` → systemctl stop openfortivpn
+                   - `status` → systemctl is-active + ppp0 IP + corp-network routes + last 5 journal lines
+                   - `logs` → journalctl -u openfortivpn -f
+                   - `test` → ping/curl one address per corporate /24 from the gateway
+                5. **Add `scripts/test-from-lan.sh`** (designed to be scp'd to a LAN
+                   client, NOT run on the gateway): pings gateway, then one IP per
+                   corporate /24, prints traceroute hops.
+                6. **Run 99-verify.sh after deploy** — must show all green except
+                   "ppp0 not up" before starting service.
+            </deliverables>
+
+            <acceptance>
+                - From a LAN client: `ssh user@163.17.38.x` works
+                - From the gateway: `apt update` still works (underlay intact)
+                - `ip route show default` does NOT contain `dev ppp0`
+                - `iptables -t nat -nvL POSTROUTING` shows MASQUERADE counter increasing
+                - systemctl restart openfortivpn → routes auto-readded by ip-up hook
+            </acceptance>
+        </phase>
+
+        <phase id="2" name="Operations — management CLI + MikroTik + docs">
+            <goal>
+                Make day-to-day operation friction-free and document the MikroTik-side
+                config so the loop is reproducible by someone other than the original
+                author.
+            </goal>
+
+            <deliverables>
+                1. **`config/mikrotik-pbr.rsc.example`** — copy-pasteable RouterOS
+                   commands for:
+                   - 3 × `/ip route add dst-address=... gateway=192.168.91.2`
+                   - Optional: mangle + routing-mark for source-aware PBR (only
+                     ether2/3/4 trigger PBR)
+                   - Optional: firewall rule allowing forward to 192.168.91.2
+                2. **`docs/deployment.adoc`** — full runbook from blank Ubuntu to
+                   working gateway, including MikroTik side, with copy-paste blocks.
+                3. **`docs/troubleshooting.adoc`** — symptom → diagnostic command →
+                   likely cause table. Cover at minimum:
+                   - VPN up but LAN client can't reach 163.17.x.x
+                   - Gateway loses internet after VPN connects
+                   - VPN keeps reconnecting in a loop
+                   - ppp0 up but no corp routes
+                   - `iptables-save` empty after reboot
+                4. **Polish 99-verify.sh** — add a section that pings one address
+                   per corporate /24 (tolerating ICMP-blocked targets gracefully).
+            </deliverables>
+
+            <acceptance>
+                - A new operator can follow deployment.adoc and reach Phase 1
+                  acceptance from scratch in one sitting
+                - troubleshooting.adoc covers every issue we hit during Phase 1
+            </acceptance>
+        </phase>
+
+        <phase id="3" name="Hardening — YubiKey / pass headless integration">
+            <goal>
+                Replace `password = ...` in /etc/openfortivpn/config with a
+                password-command that reads from `pass` (gpg-agent / pcscd backed
+                by YubiKey), suitable for headless systemd execution.
+            </goal>
+
+            <deliverables>
+                1. **`docs/yubikey-roadmap.adoc`** — design doc covering:
+                   - Whether to run gpg-agent under root vs a dedicated service user
+                   - pcscd as system service (already systemd-friendly)
+                   - PIN caching strategy (YubiKey always-require-touch vs cached PIN)
+                   - Failure mode: if YubiKey absent at boot, what should service do?
+                2. **`scripts/04-setup-pass-headless.sh`** — installs gnupg/pass/pcscd,
+                   imports public key, configures gpg-agent for non-interactive use
+                3. **`config/openfortivpn-with-passcmd.conf.example`** — replaces
+                   `password = ...` with appropriate password-input mechanism
+                   (note: openfortivpn supports password via stdin / FD, see man page)
+                4. **systemd drop-in** — `openfortivpn.service.d/passcmd.conf`
+                   wraps ExecStart so password is piped from `pass show vpn/fortigate`
+            </deliverables>
+
+            <acceptance>
+                - Gateway reboots → openfortivpn.service starts → VPN up,
+                  no human interaction
+                - YubiKey unplugged → service still runs from cached credentials
+                  OR fails gracefully (decision documented in yubikey-roadmap.adoc)
+                - Password rotation: `pass edit vpn/fortigate` + `systemctl restart`
+                  is the only operator action needed
+            </acceptance>
+        </phase>
+    </development_phases>
+
+    <!-- ════════════════════════════════════════════════════════════════
+         SECTION 5: WORKING PRACTICES
+         ════════════════════════════════════════════════════════════════ -->
+
+    <working_practices>
+        <when_modifying_scripts>
+            - All shell scripts use `set -euo pipefail` (already true for current ones)
+            - Root-required scripts check `$EUID -ne 0` and exit early
+            - Idempotent: running 03-setup-iptables.sh twice must NOT duplicate
+              rules (already handled via `iptables -C ... || iptables -A ...`)
+            - Log to /var/log/vpn-gateway-*.log when relevant (ip-up hook already
+              logs to /var/log/vpn-gateway-routes.log)
+        </when_modifying_scripts>
+
+        <when_touching_config_files>
+            - /etc/openfortivpn/config: chmod 0600, owner root:root (contains password)
+            - Never commit a real config — only `*.example` files in repo
+            - Document every non-default openfortivpn option with a "原因/Reason" line
+        </when_touching_config_files>
+
+        <when_changing_routing_or_nat>
+            - Always re-run `scripts/99-verify.sh` after changes
+            - Run `scripts/test-from-lan.sh` from an actual LAN client, not on the gateway
+            - Check `ip route show default` BEFORE and AFTER any change
+            - Expect downtime: bringing iptables/ppp0 down kicks all active conntrack flows
+        </when_changing_routing_or_nat>
+
+        <reference_directory_policy>
+            `reference/` contains LEGACY desktop-client scripts (YubiKey + screen
+            + interactive PIN). They are NOT to be deployed on the gateway.
+            Treat them as reference material only — copy ideas, not files.
+            Especially: reference/scripts/connect-vpn.sh sets `set-routes=1`
+            implicitly via fortigate.conf, which would HIJACK the gateway's
+            default route. Do NOT use it.
+        </reference_directory_policy>
+
+        <commit_discipline>
+            - One logical change per commit
+            - Commit messages in Traditional Chinese OR English (be consistent within a PR)
+            - Never commit /etc/openfortivpn/config or anything with real credentials
+            - When touching reference/, prefer to leave it untouched; if you must,
+              add a note in reference/README.md explaining why
+        </commit_discipline>
+    </working_practices>
+
+    <!-- ════════════════════════════════════════════════════════════════
+         SECTION 6: FILE-BY-FILE INVENTORY (current state)
+         ════════════════════════════════════════════════════════════════ -->
+
+    <file_inventory>
+        | File | State | Notes |
+        |------|-------|-------|
+        | `README.md` | ✅ accurate | LAN subnet examples may need confirmation |
+        | `config/openfortivpn.conf.example` | ✅ correct | All 4 critical options set; placeholders for host/user/pass/cert |
+        | `scripts/01-install.sh` | ✅ complete | Installs openfortivpn, ppp, iptables-persistent, etc. |
+        | `scripts/02-enable-ip-forward.sh` | ✅ complete | ip_forward=1, rp_filter=2 (loose) |
+        | `scripts/03-setup-iptables.sh` | ⚠ review LAN_IF detection | Auto-detects via default route — assumes single LAN-side iface |
+        | `scripts/ppp-ip-up.sh` | ✅ complete | Adds 3 × /24 routes; modify ROUTES array if subnets change |
+        | `scripts/99-verify.sh` | ✅ comprehensive | Phase 1 should add LAN-side ping section |
+        | `systemd/openfortivpn.service` | ✅ complete | Restart=always, ProtectSystem=full |
+        | `docs/architecture.adoc` | ✅ accurate | Mirrors README; includes troubleshooting cheat sheet |
+        | `reference/scripts/*` | 🚫 do-not-deploy | Desktop-client only; for YubiKey ideas in Phase 3 |
+        | `config/mikrotik-pbr.rsc.example` | ❌ missing | Phase 2 deliverable |
+        | `scripts/vpn-ctl.sh` | ❌ missing | Phase 1 deliverable |
+        | `scripts/test-from-lan.sh` | ❌ missing | Phase 1 deliverable |
+        | `docs/deployment.adoc` | ❌ missing | Phase 2 deliverable |
+        | `docs/troubleshooting.adoc` | ❌ missing | Phase 2 deliverable |
+        | `docs/yubikey-roadmap.adoc` | ❌ missing | Phase 3 deliverable |
+    </file_inventory>
+
+    <!-- ════════════════════════════════════════════════════════════════
+         SECTION 7: COMMON COMMANDS CHEAT SHEET
+         ════════════════════════════════════════════════════════════════ -->
+
+    <cheat_sheet>
+        ```bash
+        # Service control
+        sudo systemctl start    openfortivpn.service
+        sudo systemctl stop     openfortivpn.service
+        sudo systemctl status   openfortivpn.service
+        sudo systemctl restart  openfortivpn.service
+        sudo journalctl -u openfortivpn -e -f
+
+        # Verification
+        sudo bash scripts/99-verify.sh
+        ip -4 addr show ppp0
+        ip route show | grep ppp0
+        ip route show default              # MUST NOT show dev ppp0
+        sudo iptables -t nat -nvL POSTROUTING
+        sudo iptables -nvL FORWARD
+
+        # Force route reload (if ip-up didn't fire)
+        sudo /etc/ppp/ip-up.d/00-vpn-gateway-routes ppp0
+
+        # From a LAN client
+        ip route get 163.17.38.1            # next-hop should be the MikroTik
+        ssh user@163.17.38.x
+        traceroute 163.17.38.x              # first hop = MikroTik, second = 192.168.91.2
+        ```
+    </cheat_sheet>
 </agent_instruction>
