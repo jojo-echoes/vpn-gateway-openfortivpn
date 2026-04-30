@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenFortiVPN site-to-site tunnel
+Documentation=https://github.com/jojo-echoes/vpn-gateway-openfortivpn
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/openfortivpn -c /etc/openfortivpn/config
+# 斷線自動重連
+Restart=always
+RestartSec=10
+# 日誌
+StandardOutput=journal
+StandardError=journal
+
+# 安全強化（不影響功能）
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1037 @@
+= 手動輸入模式與 screen 應用
+:toc: left
+:toclevels: 4
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+
+link:03-vpn-automation.adoc[← 上一章：VPN 自動化] | link:00-overview.adoc[返回總覽] | link:05-complete-workflow.adoc[下一章：完整工作流程 →]
+
+== 章節簡介
+
+本章深入探討在沒有 YubiKey 的情況下，為何需要使用 screen 來實現 VPN 連接，包括：
+
+* 背景程序的標準輸入問題
+* screen 的虛擬終端機制
+* 互動式密碼輸入的實作
+* screen 會話管理與重新連接
+
+== 為何需要 screen？
+
+=== 問題場景分析
+
+==== 場景 1：前景執行（可行但不實用）
+
+[source,bash]
+----
+$ sudo openfortivpn -c fortigate.conf
+VPN account password: ________  ← 可以輸入
+INFO:   Authenticated.
+INFO:   Remote gateway has allocated a VPN.
+...
+[程序佔用終端，無法執行其他命令]
+----
+
+問題：
+
+* 佔用終端，無法執行其他操作
+* SSH 斷線時 VPN 也會中斷
+* 不適合長期運行
+
+==== 場景 2：nohup 背景執行（失敗）
+
+[source,bash]
+----
+$ nohup sudo openfortivpn -c fortigate.conf &
+[1] 12345
+
+# 查看日誌
+$ tail /tmp/nohup.out
+VPN account password: _____  ← 卡住了！
+----
+
+問題本質：
+
+[source]
+----
+背景程序的限制：
+  
+  前景程序:
+    stdin  ← 連接到終端（可輸入）
+    stdout → 連接到終端（可顯示）
+    stderr → 連接到終端（可顯示）
+  
+  背景程序（&）:
+    stdin  ← 連接到 /dev/null（無法輸入）
+    stdout → 連接到終端或檔案
+    stderr → 連接到終端或檔案
+    
+  問題：
+    openfortivpn 嘗試從 stdin 讀取密碼
+    → stdin = /dev/null
+    → 讀取失敗，程序卡住
+----
+
+==== 場景 3：使用重導向（也失敗）
+
+[source,bash]
+----
+# 嘗試 1：重導向終端
+$ sudo openfortivpn -c fortigate.conf < /dev/tty &
+[1] 12345
+[1]+  Stopped    sudo openfortivpn -c fortigate.conf < /dev/tty
+----
+
+程序立即停止（SIGTTIN 信號）。
+
+原因：
+
+[source]
+----
+背景程序嘗試從終端讀取時：
+  1. 背景程序讀取 /dev/tty
+  2. 核心檢測到「背景程序存取終端輸入」
+  3. 核心發送 SIGTTIN 信號
+  4. 程序預設行為：停止（Stopped）
+  
+這是 Unix 的設計：防止多個程序同時讀取鍵盤輸入造成混亂
+----
+
+==== 場景 4：使用 expect（過於複雜）
+
+[source,bash]
+----
+#!/usr/bin/expect
+spawn sudo openfortivpn -c fortigate.conf
+expect "VPN account password:"
+send "your_password\r"
+interact
+----
+
+問題：
+
+* 需要額外安裝 `expect`
+* 密碼明文寫在腳本中（不安全）
+* 不如 pass + YubiKey 安全
+
+=== screen 如何解決問題
+
+==== screen 的虛擬終端機制
+
+[source]
+----
+傳統終端：
+  使用者 → 實體終端 (tty1/pts/0) → 程序
+  
+  問題：
+    • SSH 斷線 → 終端關閉 → 程序收到 SIGHUP → 終止
+    • 背景程序無法讀取 stdin
+
+screen 虛擬終端：
+  使用者 → screen client → screen server → 虛擬終端 → 程序
+                           ↑
+                      持續運行，即使 client 斷線
+  
+  優點：
+    • 虛擬終端永遠存在（除非明確終止）
+    • 程序有完整的 stdin/stdout/stderr
+    • 可以「離開」（detach）虛擬終端，程序繼續運行
+    • 可以「重新連接」（reattach）虛擬終端
+----
+
+==== screen 的工作流程
+
+[source]
+----
+步驟 1: 啟動 screen 會話
+  $ screen -S vpn
+  → 建立名為 "vpn" 的虛擬終端
+  → 啟動一個 shell 在虛擬終端內
+
+步驟 2: 在虛擬終端內執行 VPN
+  [screen 內] $ sudo openfortivpn -c fortigate.conf
+  VPN account password: ________  ← 可以輸入（有 stdin）
+  INFO:   Authenticated.
+  ...
+  [VPN 保持運行]
+
+步驟 3: 離開虛擬終端（VPN 繼續運行）
+  [按 Ctrl+A 然後 D]
+  [detached from 12345.vpn]
+  → 回到原始終端
+  → VPN 在 screen 虛擬終端內繼續運行
+
+步驟 4: 重新連接虛擬終端
+  $ screen -r vpn
+  → 重新連接到 "vpn" 虛擬終端
+  → 看到 VPN 的持續輸出
+----
+
+== screen 基礎知識
+
+=== 安裝 screen
+
+[source,bash]
+----
+$ sudo apt update
+$ sudo apt install screen
+----
+
+==== 驗證安裝
+
+[source,bash]
+----
+$ screen --version
+Screen version 4.09.00 (GNU) 30-Jan-22
+----
+
+=== screen 基本操作
+
+==== 建立新會話
+
+[source,bash]
+----
+# 語法：screen -S <session_name>
+$ screen -S test
+
+# 此時進入虛擬終端
+# 可以執行任何命令
+$ echo "Hello from screen"
+Hello from screen
+----
+
+==== 離開會話（detach）
+
+[source]
+----
+在 screen 內按：
+  Ctrl+A → 啟動 screen 命令模式
+  D      → Detach（離開）
+
+顯示訊息：
+  [detached from 12345.test]
+----
+
+==== 列出會話
+
+[source,bash]
+----
+$ screen -list
+There is a screen on:
+    12345.test	(Detached)
+1 Socket in /run/screen/S-jojo.
+----
+
+狀態說明：
+
+* `Attached`: 當前已連接
+* `Detached`: 已離開，可重新連接
+
+==== 重新連接會話（reattach）
+
+[source,bash]
+----
+# 語法：screen -r <session_name>
+$ screen -r test
+
+# 回到之前的虛擬終端
+# 之前執行的程序仍在運行
+----
+
+==== 終止會話
+
+方法 1：在 screen 內執行 `exit`
+
+[source,bash]
+----
+$ screen -r test
+[screen 內] $ exit
+[screen is terminating]
+----
+
+方法 2：從外部終止
+
+[source,bash]
+----
+$ screen -S test -X quit
+----
+
+=== screen 常用快捷鍵
+
+所有 screen 命令都以 `Ctrl+A` 開始：
+
+[cols="1,1,3"]
+|===
+| 快捷鍵 | 功能 | 說明
+
+| `Ctrl+A D`
+| Detach
+| 離開會話（程序繼續運行）
+
+| `Ctrl+A K`
+| Kill
+| 終止當前視窗
+
+| `Ctrl+A [`
+| Copy mode
+| 進入複製模式（可捲動查看歷史）
+
+| `Ctrl+A ?`
+| Help
+| 顯示說明
+
+| `Ctrl+A :`
+| Command
+| 輸入 screen 命令
+|===
+
+== 手動模式實作
+
+=== 設計目標
+
+[source]
+----
+需求：
+  1. 使用者可以輸入密碼
+  2. VPN 在背景持續運行
+  3. 可以重新連接查看狀態
+  4. 易於理解和操作
+
+解決方案：
+  • 使用 screen 建立虛擬終端
+  • 在 screen 內執行 openfortivpn
+  • 提供清楚的使用者指引
+  • 實作自動狀態檢查
+----
+
+=== 包裝腳本設計
+
+==== 為何需要包裝腳本？
+
+[source]
+----
+問題：直接執行 openfortivpn
+  $ screen -S vpn sudo openfortivpn -c fortigate.conf
+  → 密碼輸入完成後，VPN 連接
+  → 看到一堆技術日誌
+  → 使用者不知道連接狀態
+  → 不知道如何離開
+  
+改進：使用包裝腳本
+  $ screen -S vpn /tmp/vpn-connect-wrapper.sh
+  → 顯示友善的使用者指引
+  → 解釋密碼輸入步驟
+  → 自動檢查連接狀態
+  → 提供離開和重新連接說明
+----
+
+==== 包裝腳本結構
+
+[source,bash]
+----
+cat > /tmp/vpn-connect-wrapper.sh << 'WRAPPER_EOF'
+#!/bin/bash
+SCRIPT_DIR=$1
+
+# 第一部分：使用者指引
+echo ""
+echo "=========================================="
+echo "⚠️  手動輸入密碼模式"
+echo "=========================================="
+echo ""
+echo "接下來會出現以下提示："
+echo "  1. [sudo] password for jojo: ← 輸入 Linux sudo 密碼"
+echo "  2. VPN account password: ← 只需輸入 VPN 密碼即可"
+echo ""
+echo "說明："
+echo "  • VPN 帳號已在設定檔中（jojoboyx）"
+echo "  • 只需要輸入密碼，不需要輸入帳號"
+echo "  • 密碼輸入時不會顯示任何字元（正常現象）"
+echo ""
+echo "=========================================="
+echo ""
+
+# 第二部分：狀態檢查函數
+check_vpn_status() {
+    echo ""
+    echo "=== 等待 VPN 介面建立 ==="
+    
+    # 等待 ppp0 出現
+    for i in {1..60}; do
+        if ip addr show ppp0 &>/dev/null 2>&1; then
+            echo "✓ VPN 介面 ppp0 已建立"
+            break
+        fi
+        sleep 1
+        if [ $((i % 5)) -eq 0 ]; then
+            echo -n "."
+        fi
+    done
+    
+    if ! ip addr show ppp0 &>/dev/null 2>&1; then
+        echo "✗ VPN 連接失敗"
+        return 1
+    fi
+    
+    # 顯示 VPN IP
+    VPN_IP=$(ip addr show ppp0 | grep "inet " | awk '{print $2}')
+    echo "VPN IP: $VPN_IP"
+    
+    # 等待路由更新
+    sleep 2
+    
+    # 顯示路由表
+    echo ""
+    echo "=== Server 推送的路由 ==="
+    ip route show | grep "dev ppp0" | head -10
+    
+    # 測試連接
+    echo ""
+    echo "=== 測試連接 ==="
+    if ping -c 2 -W 3 163.17.38.238 &>/dev/null; then
+        echo "✓ Cisco 設備 (163.17.38.238) 可達"
+    else
+        echo "⚠ Cisco 設備 ping 失敗（可能禁止 ICMP）"
+    fi
+    
+    # 第三部分：最終說明
+    echo ""
+    echo "=========================================="
+    echo "✓ VPN 連接完成（由 Fortigate Server 管理路由）"
+    echo "=========================================="
+    echo "現在可以 SSH 到 Cisco:"
+    echo "  ssh admin@163.17.38.238"
+    echo ""
+    echo "中斷 VPN: $SCRIPT_DIR/disconnect-vpn.sh"
+    echo "查看狀態: $SCRIPT_DIR/show-vpn-status.sh"
+    echo ""
+    echo "按 Ctrl+A 然後 D 離開（VPN 繼續運行）"
+    echo "重新連接: screen -r vpn"
+    echo "=========================================="
+}
+
+# 第四部分：在背景執行狀態檢查
+check_vpn_status &
+
+# 第五部分：啟動 VPN（前景執行）
+sudo openfortivpn -c "$SCRIPT_DIR/fortigate.conf"
+
+# VPN 中斷後的清理
+echo ""
+echo "VPN 已中斷"
+WRAPPER_EOF
+
+chmod +x /tmp/vpn-connect-wrapper.sh
+----
+
+==== 設計亮點
+
+[cols="1,3"]
+|===
+| 特性 | 說明
+
+| 使用者友善
+| 詳細解釋每個步驟，減少困惑
+
+| 狀態檢查背景執行
+| `check_vpn_status &` 不阻塞密碼輸入
+
+| 完整的 screen 說明
+| 教使用者如何離開和重新連接
+
+| 路徑參數化
+| `SCRIPT_DIR=$1` 支援任意安裝位置
+|===
+
+=== 使用者體驗流程
+
+==== 完整互動過程
+
+[source]
+----
+第 1 步：啟動連接腳本
+  $ bash ./connect-vpn.sh
+  
+  檢測結果：
+    ⚠️  未檢測到 YubiKey
+    將使用手動輸入模式...
+
+第 2 步：顯示說明
+  ==========================================
+  ⚠️  手動輸入密碼模式
+  ==========================================
+  
+  原因：YubiKey 未檢測到 或 pass 密碼管理器不可用
+  
+  接下來的操作：
+    1. 進入 screen 會話（背景運行 VPN）
+    2. 系統會要求輸入 sudo 密碼
+    3. 然後要求輸入 VPN 密碼（只需密碼，不需帳號）
+  
+  按 Enter 繼續...
+
+第 3 步：進入 screen
+  [按 Enter]
+  
+  ┌───────────────────────────────────────┐
+  │ screen 虛擬終端                       │
+  ├───────────────────────────────────────┤
+  │ ⚠️  手動輸入密碼模式                  │
+  │                                       │
+  │ 接下來會出現以下提示：                │
+  │   1. [sudo] password for jojo:        │
+  │   2. VPN account password:            │
+  │                                       │
+  │ 說明：                                │
+  │   • VPN 帳號已在設定檔中（jojoboyx）  │
+  │   • 只需輸入密碼，不需帳號            │
+  └───────────────────────────────────────┘
+
+第 4 步：輸入 sudo 密碼
+  [sudo] password for jojo: ********
+
+第 5 步：輸入 VPN 密碼
+  VPN account password: ****************
+
+第 6 步：VPN 連接中
+  INFO:   Connected to gateway.
+  INFO:   Authenticated.
+  INFO:   Remote gateway has allocated a VPN.
+  
+  [同時，背景的 check_vpn_status 開始檢查]
+
+第 7 步：狀態檢查完成
+  === 等待 VPN 介面建立 ===
+  .....
+  ✓ VPN 介面 ppp0 已建立
+  VPN IP: 10.212.134.100/32
+  
+  === Server 推送的路由 ===
+  140.128.0.0/16 dev ppp0 scope link
+  ...
+  
+  ✓ VPN 連接完成
+  
+  按 Ctrl+A 然後 D 離開（VPN 繼續運行）
+  重新連接: screen -r vpn
+
+第 8 步：離開 screen
+  [按 Ctrl+A]
+  [按 D]
+  
+  [detached from 12345.vpn]
+  
+  回到原始終端，可以執行其他命令
+
+第 9 步：重新連接（可選）
+  $ screen -r vpn
+  
+  [看到 VPN 持續運行的輸出]
+----
+
+=== 為何使用「VPN account password」提示？
+
+==== 使用者的困惑
+
+[source]
+----
+問題場景：
+  VPN account password: _____
+  ↑
+  使用者想：「VPN 帳號密碼」是什麼意思？
+    • 需要輸入「帳號:密碼」嗎？
+    • 還是只輸入密碼？
+    • 帳號在哪裡？
+----
+
+==== 解決方案
+
+[source,bash]
+----
+# 在包裝腳本中明確說明
+echo "說明："
+echo "  • VPN 帳號已在設定檔中（jojoboyx）"
+echo "  • 只需要輸入密碼，不需要輸入帳號"
+echo "  • 密碼輸入時不會顯示任何字元（正常現象）"
+----
+
+==== openfortivpn 的行為
+
+[source]
+----
+openfortivpn 讀取順序：
+
+1. 讀取 fortigate.conf
+   username = jojoboyx  ← 已設定
+
+2. 檢查 password 欄位
+   password = (空白)    ← 未設定
+
+3. 從 stdin 讀取密碼
+   提示: "VPN account password:"
+   實際上只需要密碼（帳號已在設定檔）
+
+4. 組合帳號+密碼
+   → 使用 jojoboyx + 使用者輸入的密碼
+   → 送到 FortiGate 伺服器驗證
+----
+
+TIP: openfortivpn 的提示訊息「VPN account password」是固定的，無法修改，因此需要在腳本中額外說明。
+
+== 對比：自動模式 vs 手動模式
+
+=== 執行流程對比
+
+[source]
+----
+自動模式（YubiKey）:
+  1. 偵測 YubiKey → ✓ 存在
+  2. pass show vpn/fortigate
+     ├─ 要求 YubiKey PIN（一次）
+     └─ 取得密碼
+  3. sudo -v（預先驗證）
+  4. nohup bash -c "pass ... | sudo openfortivpn" &
+  5. 儲存 PID 到 /tmp/vpn.pid
+  6. 等待 ppp0 建立
+  7. 顯示狀態 → 完成
+  
+  優點：
+    • 全自動，無需多次輸入
+    • PIN 快取 10 分鐘
+    • PID 追蹤，可靠中斷
+  
+  缺點：
+    • 需要 YubiKey 硬體
+    • 需要預先設置 pass
+
+手動模式（screen）:
+  1. 偵測 YubiKey → ✗ 不存在
+  2. 建立包裝腳本 /tmp/vpn-connect-wrapper.sh
+  3. screen -S vpn /tmp/vpn-connect-wrapper.sh
+  4. [screen 內] 顯示使用者指引
+  5. [screen 內] sudo openfortivpn
+     ├─ 輸入 sudo 密碼
+     └─ 輸入 VPN 密碼
+  6. [screen 內] 背景檢查狀態
+  7. 使用者離開 screen (Ctrl+A D)
+  
+  優點：
+    • 不需要 YubiKey
+    • 不需要預先設置
+    • 容易理解
+  
+  缺點：
+    • 需要手動輸入兩次密碼
+    • screen 操作略複雜
+    • 無 PID 追蹤（使用 screen -list 管理）
+----
+
+=== 中斷方式對比
+
+==== 自動模式中斷
+
+[source,bash]
+----
+$ bash ./disconnect-vpn.sh
+
+# 腳本邏輯：
+if [ -f /tmp/vpn.pid ]; then
+    VPN_PID=$(cat /tmp/vpn.pid)
+    sudo kill $VPN_PID
+    rm -f /tmp/vpn.pid
+fi
+----
+
+精確終止特定程序。
+
+==== 手動模式中斷
+
+[source,bash]
+----
+$ bash ./disconnect-vpn.sh
+
+# 腳本邏輯：
+if screen -list | grep -q "\.vpn"; then
+    screen -S vpn -X quit
+fi
+----
+
+終止 screen 會話，內部的 openfortivpn 也會收到 SIGHUP 並終止。
+
+=== 適用場景
+
+[cols="1,2,2"]
+|===
+| 場景 | 建議模式 | 原因
+
+| 日常使用
+| 自動模式（YubiKey）
+| 方便快速，安全性高
+
+| YubiKey 遺失
+| 手動模式
+| 仍可使用 VPN
+
+| 首次設置
+| 手動模式
+| 測試 VPN 連接參數
+
+| 臨時使用
+| 手動模式
+| 無需攜帶 YubiKey
+
+| 自動化排程
+| 自動模式
+| 可完全無人值守
+
+| 除錯
+| 手動模式
+| 可看到即時輸出
+|===
+
+== 進階 screen 技巧
+
+=== 在 screen 中滾動查看歷史
+
+[source]
+----
+問題：
+  screen 中的輸出超過螢幕高度時，無法用滑鼠滾輪查看
+
+解決：
+  1. 按 Ctrl+A [   ← 進入 copy mode
+  2. 使用方向鍵或 Page Up/Down 滾動
+  3. 按 Esc 退出 copy mode
+----
+
+=== 複製 screen 中的文字
+
+[source]
+----
+步驟：
+  1. Ctrl+A [       ← 進入 copy mode
+  2. 移動游標到起點
+  3. 按 Space      ← 開始選擇
+  4. 移動游標到終點
+  5. 按 Space      ← 結束選擇（文字已複製）
+  6. Ctrl+A ]      ← 貼上
+
+或：
+  直接用滑鼠選擇並複製（終端模擬器支援）
+----
+
+=== screen 日誌記錄
+
+[source,bash]
+----
+# 啟動時開啟日誌
+$ screen -L -Logfile /tmp/screen-vpn.log -S vpn
+
+# 或在 screen 內啟動
+[screen 內] Ctrl+A H
+
+# 所有輸出會儲存到 screenlog.0
+----
+
+=== 多視窗 screen（進階）
+
+[source,bash]
+----
+# 在 screen 內建立新視窗
+Ctrl+A C    ← Create new window
+
+# 切換視窗
+Ctrl+A N    ← Next window
+Ctrl+A P    ← Previous window
+Ctrl+A 0-9  ← 跳到特定視窗
+
+# 列出視窗
+Ctrl+A "    ← 顯示視窗列表
+----
+
+範例應用：
+
+[source]
+----
+視窗 0: VPN 連接（openfortivpn 運行中）
+視窗 1: SSH 到 Cisco 設備
+視窗 2: 查看 VPN 日誌
+視窗 3: 監控網路狀態（ip route、ping）
+----
+
+== tmux 作為替代方案
+
+=== tmux vs screen
+
+[cols="1,2,2"]
+|===
+| 特性 | screen | tmux
+
+| 功能
+| 基本虛擬終端
+| 進階終端多工器
+
+| 分割視窗
+| 基本支援
+| 完整支援（水平/垂直）
+
+| 設定
+| ~/.screenrc
+| ~/.tmux.conf
+
+| 命令前綴
+| Ctrl+A
+| Ctrl+B（預設）
+
+| 學習曲線
+| 較簡單
+| 較陡峭
+
+| 普及度
+| 傳統標準
+| 現代首選
+|===
+
+=== 使用 tmux 的等效命令
+
+[source,bash]
+----
+# 建立會話
+$ tmux new -s vpn
+
+# 離開會話
+Ctrl+B D
+
+# 列出會話
+$ tmux ls
+
+# 重新連接
+$ tmux attach -t vpn
+
+# 終止會話
+$ tmux kill-session -t vpn
+----
+
+=== 本專案為何選擇 screen？
+
+[source]
+----
+原因：
+  1. Ubuntu 預裝（不需額外安裝）
+  2. 功能足夠（只需基本的 detach/attach）
+  3. 較簡單的快捷鍵（Ctrl+A D）
+  4. 文件更普及
+
+如果您偏好 tmux：
+  • 將 screen -S vpn 改為 tmux new -s vpn
+  • 將 screen -r vpn 改為 tmux attach -t vpn
+  • 將 screen -S vpn -X quit 改為 tmux kill-session -t vpn
+  • 其餘邏輯完全相同
+----
+
+== 故障排除
+
+=== 問題 1：screen 找不到
+
+==== 錯誤訊息
+
+[source,bash]
+----
+$ screen -S vpn
+bash: screen: command not found
+----
+
+==== 解決
+
+[source,bash]
+----
+$ sudo apt update
+$ sudo apt install screen
+----
+
+=== 問題 2：screen 會話無法重新連接
+
+==== 錯誤訊息
+
+[source,bash]
+----
+$ screen -r vpn
+There is no screen to be resumed matching vpn.
+----
+
+==== 原因與解決
+
+原因 1：會話已終止
+
+[source,bash]
+----
+# 檢查所有會話
+$ screen -list
+No Sockets found in /run/screen/S-jojo.
+
+→ 會話確實已終止，需要重新啟動 VPN
+----
+
+原因 2：會話名稱錯誤
+
+[source,bash]
+----
+$ screen -list
+There is a screen on:
+    12345.VPN	(Detached)  ← 注意大小寫
+
+$ screen -r VPN  ← 使用正確的名稱
+----
+
+原因 3：會話屬於其他使用者
+
+[source,bash]
+----
+$ sudo screen -list
+There is a screen on:
+    12345.vpn	(Detached)
+    
+$ sudo screen -r vpn  ← 需要 sudo
+----
+
+=== 問題 3：VPN 密碼輸入後無反應
+
+==== 症狀
+
+[source]
+----
+VPN account password: ****************
+[沒有任何輸出，長時間無反應]
+----
+
+==== 可能原因與解決
+
+原因 1：網路連接問題
+
+[source,bash]
+----
+# 測試 FortiGate 伺服器連接
+$ nc -zv 163.17.117.94 34401
+163.17.117.94 34401 (fortinet-sslvpn) open  ← 正常
+
+# 如果連接失敗 → 檢查防火牆或網路
+----
+
+原因 2：密碼錯誤
+
+[source,bash]
+----
+# openfortivpn 預設會重試 3 次
+# 查看 screen 內的輸出：
+
+ERROR:  Gateway authentication failed.
+VPN account password: _____  ← 重新輸入
+----
+
+原因 3：FortiGate 伺服器問題
+
+[source,bash]
+----
+# 查看詳細錯誤
+[screen 內]
+ERROR:  Gateway returned an error: ...
+
+→ 聯繫 IT 管理員
+----
+
+=== 問題 4：離開 screen 後找不到 VPN
+
+==== 症狀
+
+[source,bash]
+----
+$ ip addr show ppp0
+Device "ppp0" does not exist.
+
+但 screen 會話還在：
+$ screen -list
+There is a screen on:
+    12345.vpn	(Detached)
+----
+
+==== 原因與解決
+
+原因：VPN 連接在 screen 內已中斷
+
+[source,bash]
+----
+# 重新連接 screen 查看
+$ screen -r vpn
+
+[看到]
+ERROR:  Gateway closed the connection.
+VPN 已中斷
+
+# 在 screen 內重新啟動
+$ sudo openfortivpn -c /path/to/fortigate.conf
+----
+
+== 小結
+
+=== 關鍵要點
+
+1. **背景程序無 stdin**：`&` 背景執行會將 stdin 連接到 /dev/null
+2. **SIGTTIN 信號**：背景程序讀取 /dev/tty 會被停止
+3. **screen 虛擬終端**：提供持久化的 stdin/stdout/stderr
+4. **包裝腳本**：提升使用者體驗，提供狀態檢查和說明
+5. **雙模式設計**：YubiKey 自動化 + screen 手動化，相互補充
+6. **VPN account password**：openfortivpn 固定提示，需額外說明
+
+=== screen 操作速查表
+
+[cols="1,2"]
+|===
+| 操作 | 命令
+
+| 建立會話
+| `screen -S vpn`
+
+| 離開會話
+| `Ctrl+A D`
+
+| 列出會話
+| `screen -list`
+
+| 重新連接
+| `screen -r vpn`
+
+| 終止會話
+| `screen -S vpn -X quit`
+
+| 滾動查看
+| `Ctrl+A [` → 方向鍵 → `Esc`
+
+| 複製文字
+| `Ctrl+A [` → `Space` → 選擇 → `Space`
+|===
+
+=== 驗證清單
+
+手動模式實作完成檢查：
+
+- [ ] YubiKey 移除後自動切換到手動模式
+- [ ] screen 會話成功建立並命名為 "vpn"
+- [ ] 包裝腳本顯示清楚的使用者指引
+- [ ] 可以輸入 sudo 密碼和 VPN 密碼
+- [ ] 狀態檢查正確顯示 VPN IP 和路由
+- [ ] `Ctrl+A D` 可離開，VPN 繼續運行
+- [ ] `screen -r vpn` 可重新連接
+- [ ] disconnect-vpn.sh 可正確終止 screen 會話
+
+=== 下一章預告
+
+link:05-complete-workflow.adoc[下一章] 將探討：
+
+* 完整的日常使用工作流程
+* 常見問題的故障排除
+* 安全最佳實踐
+* 系統維護建議
+
+---
+
+link:03-vpn-automation.adoc[← 上一章：VPN 自動化] | link:00-overview.adoc[返回總覽] | link:05-complete-workflow.adoc[下一章：完整工作流程 →]

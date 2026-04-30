@@ -1,0 +1,8 @@
+# 真正的設定檔絕對不要 commit
+/etc/openfortivpn/config
+config/openfortivpn.conf
+config/*.conf
+!config/*.example
+*.pem
+*.key
+*.log

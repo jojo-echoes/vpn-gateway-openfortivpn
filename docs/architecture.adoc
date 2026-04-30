@@ -1,0 +1,92 @@
+= vpn-gateway-openfortivpn — 架構與設計說明
+:toc: left
+:toclevels: 3
+:sectnums:
+
+== 目標
+
+把 `vpn-gateway.home.arpa`（Ubuntu Server，IP `192.168.91.2/24`）改造為
+**Site-to-Site VPN 閘道器**，讓 LAN 端其他主機透過它把流量送進公司
+FortiGate VPN，但**不影響該主機自身的對外網路（underlay）**。
+
+== Underlay vs Overlay
+
+[cols="1,2,3"]
+|===
+| 層級 | 路徑 | 必要條件
+
+| Underlay
+| 本機 → MikroTik (192.168.91.1) → Internet → FortiGate
+| 預設路由必須一直指向 192.168.91.1；openfortivpn 的 TLS 封包靠它出去
+
+| Overlay
+| (LAN client) → MikroTik(PBR) → 192.168.91.2 → ppp0 → FortiGate → 公司網段
+| ppp0 上做 SNAT(MASQUERADE)；只在 ppp0 上加公司網段路由
+|===
+
+== 為什麼 set-routes = 0
+
+`openfortivpn` 預設會：
+
+1. 把 server 推的 split routes 寫進系統路由表
+2. （某些情境下）把 default route 改成走 ppp0
+
+對「只是個 user 在自己電腦連 VPN」沒問題，但對 **gateway 主機是災難**：
+default route 一旦被改，TLS 封包就再也送不到 FortiGate，VPN 自己會斷。
+
+所以本專案：
+
+* `set-routes = 0` — 完全禁止 openfortivpn 動系統路由表
+* `set-dns = 0` / `pppd-use-peerdns = 0` — 不動 `/etc/resolv.conf`
+* 改由 `/etc/ppp/ip-up.d/00-vpn-gateway-routes` 在 ppp0 起來後**只**加 3 條
+  `/24` 公司網段的 directed route 到 ppp0
+
+== 為什麼路由要在 ip-up 而不是 systemd
+
+ppp0 介面是 openfortivpn 跑起來才建立的，systemd 的 `ExecStartPost=` 沒辦法
+保證在那之後執行；而且每次重連 ppp0 都會重建，路由也要重加。
+pppd 的 `ip-up.d` 機制就是專門解決這件事的標準鉤子。
+
+== NAT 的必要性
+
+LAN clients 的來源 IP（如 `192.168.88.10`）在 FortiGate 那端是無路由可回的；
+公司 FortiGate 只認得它分配給此 client 的 VPN IP（ppp0 的 local IP）。
+因此**所有從 ppp0 出去的封包都必須 SNAT/MASQUERADE 成 ppp0 的 IP**：
+
+----
+iptables -t nat -A POSTROUTING -o ppp0 -j MASQUERADE
+----
+
+加上 FORWARD 規則允許 LAN→VPN 與其回程（conntrack ESTABLISHED,RELATED）。
+
+== MikroTik 端的 PBR（提醒，不在本專案範圍）
+
+MikroTik 上需要把目的地為下列網段的封包，next-hop 設成 192.168.91.2：
+
+* 163.17.38.0/24
+* 163.17.40.0/24
+* 140.128.53.0/24
+
+例如：
+
+----
+/ip route
+add dst-address=163.17.38.0/24  gateway=192.168.91.2
+add dst-address=163.17.40.0/24  gateway=192.168.91.2
+add dst-address=140.128.53.0/24 gateway=192.168.91.2
+----
+
+或用 mangle + routing-mark 做 source-aware 的 PBR；
+若要限制「只有特定 LAN 子網才能走 VPN」可在 mangle 內加 src-address 條件。
+
+== 故障排除速查
+
+[cols="2,3"]
+|===
+| 症狀 | 檢查
+
+| VPN 一上線就整台 server 沒網 | `ip route` 看 default 是不是被改成 ppp0；確認 set-routes=0
+| LAN client 連得到 192.168.91.2 但連不到公司 IP | `iptables -t nat -nvL POSTROUTING` 看 MASQUERADE 計數是否增加；`ip route get 163.17.38.x` 確認從 ppp0 出去
+| ppp0 起得來但路由沒加 | 看 `/var/log/vpn-gateway-routes.log`，確認 ip-up 鉤子有觸發
+| systemd 重啟一直失敗 | `journalctl -u openfortivpn -e`；常見是 trusted-cert 不對
+|===

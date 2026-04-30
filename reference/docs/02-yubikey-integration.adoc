@@ -1,0 +1,1247 @@
+= YubiKey 與 OpenPGP 整合
+:toc: left
+:toclevels: 4
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+
+link:01-openpgp-encryption.adoc[← 上一章：OpenPGP 加密] | link:00-overview.adoc[返回總覽] | link:03-vpn-automation.adoc[下一章：VPN 自動化 →]
+
+== 章節簡介
+
+本章深入探討如何將 GPG 私鑰安全地轉移到 YubiKey 智能卡，包括：
+
+* YubiKey OpenPGP 應用程式的架構
+* 私鑰轉移的完整步驟
+* Admin PIN 的作用與必要性
+* 雙 YubiKey 備份策略的實作
+* 為何需要輸入 `key 1` 進入子金鑰編輯
+
+== YubiKey 與 OpenPGP 的關係
+
+=== YubiKey OpenPGP 應用程式
+
+YubiKey 5C NFC 內建多個應用程式，其中之一是 **OpenPGP 應用程式**（基於 ISO 7816-4 智能卡標準）。
+
+==== 應用程式架構
+
+[source]
+----
+┌─────────────────────────────────────┐
+│       YubiKey 5C NFC 韌體           │
+│         (Firmware 5.7.4)            │
+├─────────────────────────────────────┤
+│  ┌────────────┐  ┌────────────┐    │
+│  │   FIDO2    │  │   PIV      │    │  ← 其他應用程式
+│  └────────────┘  └────────────┘    │
+│  ┌────────────────────────────┐    │
+│  │   OpenPGP 應用程式 (v3.4)  │    │  ← 本專案使用
+│  │  • 支援 RSA 4096           │    │
+│  │  • 三個金鑰插槽            │    │
+│  │  • PIN/Admin PIN 保護      │    │
+│  └────────────────────────────┘    │
+│  ┌────────────────────────────┐    │
+│  │      安全元件 (Secure      │    │  ← 硬體加密引擎
+│  │      Element)              │    │
+│  │  • 私鑰永不離開            │    │
+│  │  • 抗物理攻擊              │    │
+│  └────────────────────────────┘    │
+└─────────────────────────────────────┘
+----
+
+==== OpenPGP 應用程式特性
+
+[cols="1,3"]
+|===
+| 特性 | 說明
+
+| OpenPGP 版本
+| 3.4 (支援 RSA 4096, ECC P-256/P-384/P-521)
+
+| 金鑰插槽
+| 3 個（Signature, Encryption, Authentication）
+
+| PIN 保護
+| User PIN（預設 123456）+ Admin PIN（預設 12345678）
+
+| PIN 嘗試次數
+| User PIN: 3 次，Admin PIN: 3 次
+
+| 金鑰產生
+| 可在卡上產生或從外部匯入
+
+| 私鑰匯出
+| **不可能**（單向操作）
+
+| 重置功能
+| 可透過 Admin PIN 或 ykman 重置
+|===
+
+=== YubiKey 的三個金鑰插槽
+
+[source]
+----
+┌─────────────────────────────────────┐
+│     YubiKey OpenPGP 金鑰儲存        │
+├─────────────────────────────────────┤
+│                                     │
+│  插槽 1: Signature Key [S]         │
+│  • 用於簽署資料                     │
+│  • 對應 GPG 主金鑰                  │
+│  • Key fingerprint: ABC123...       │
+│                                     │
+│  插槽 2: Encryption Key [E]        │
+│  • 用於解密資料                     │
+│  • 對應 GPG 子金鑰                  │
+│  • Key fingerprint: DEF456...       │
+│  • ★ 本專案使用此插槽 ★            │
+│                                     │
+│  插槽 3: Authentication Key [A]    │
+│  • 用於身份驗證（SSH）              │
+│  • 本專案未使用                     │
+│  • Key fingerprint: GHI789...       │
+│                                     │
+└─────────────────────────────────────┘
+----
+
+== 環境準備
+
+=== 檢查 YubiKey 是否被識別
+
+==== 使用 lsusb 確認硬體
+
+[source,bash]
+----
+$ lsusb | grep Yubico
+Bus 001 Device 002: ID 1050:0407 Yubico.com Yubikey 5 NFC
+----
+
+[cols="1,1,3"]
+|===
+| 欄位 | 值 | 說明
+
+| Vendor ID
+| 1050
+| Yubico 公司
+
+| Product ID
+| 0407
+| YubiKey 5 系列（包含 5C NFC）
+
+| Bus
+| 001
+| USB Bus 編號
+
+| Device
+| 002
+| USB 裝置編號
+|===
+
+==== VMware USB 直通設置
+
+IMPORTANT: 在 VMware 環境中，必須使用 **USB 3.1** 控制器才能可靠識別智能卡。
+
+[source]
+----
+VMware Workstation 設置：
+1. 關閉虛擬機
+2. 編輯虛擬機設定
+3. USB 控制器 → USB 3.1
+4. 新增 → USB 裝置 → Yubico YubiKey OTP+FIDO+CCID
+5. 啟動虛擬機
+----
+
+==== 設置 udev 規則（權限）
+
+[source,bash]
+----
+# 建立 udev 規則
+$ sudo tee /etc/udev/rules.d/70-yubikey.rules << 'EOF'
+# YubiKey 5 series
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0407", MODE="0666", GROUP="plugdev"
+EOF
+
+# 重新載入 udev 規則
+$ sudo udevadm control --reload-rules
+$ sudo udevadm trigger
+
+# 確認使用者在 plugdev 群組
+$ sudo usermod -aG plugdev $USER
+----
+
+WARNING: 新增群組後需要**完全登出再登入**（或重啟 SSH），群組權限才會生效。
+
+=== 安裝必要工具
+
+==== 安裝智能卡相關套件
+
+[source,bash]
+----
+$ sudo apt update
+$ sudo apt install -y \
+    pcscd \          # PC/SC Smart Card Daemon
+    scdaemon \       # GnuPG SmartCard Daemon
+    libpcsclite1 \   # PC/SC 函式庫
+    opensc \         # OpenSC 智能卡工具
+    yubikey-manager  # YubiKey 管理工具
+----
+
+==== 啟動智能卡服務
+
+[source,bash]
+----
+# 啟動 pcscd
+$ sudo systemctl start pcscd
+$ sudo systemctl enable pcscd
+
+# 檢查服務狀態
+$ systemctl status pcscd
+● pcscd.service - PC/SC Smart Card Daemon
+     Loaded: loaded (/lib/systemd/system/pcscd.service; enabled)
+     Active: active (running)
+----
+
+=== 驗證 GPG 可讀取 YubiKey
+
+==== 使用 gpg --card-status
+
+[source,bash]
+----
+$ gpg --card-status
+Reader ...........: Yubico YubiKey OTP FIDO CCID 0
+Application ID ...: D2760001240100000006347184160000
+Application type .: OpenPGP
+Version ..........: 3.4
+Manufacturer .....: Yubico
+Serial number ....: 34718416
+Name of cardholder: [not set]
+Language prefs ...: [not set]
+Salutation .......: 
+URL of public key : [not set]
+Login data .......: [not set]
+Signature PIN ....: not forced
+Key attributes ...: rsa2048 rsa2048 rsa2048
+Max. PIN lengths .: 127 127 127
+PIN retry counter : 3 0 3
+Signature counter : 0
+KDF setting ......: off
+Signature key ....: [none]
+Encryption key ...: [none]
+Authentication key: [none]
+General key info..: [none]
+----
+
+重要欄位解析：
+
+[cols="1,3"]
+|===
+| 欄位 | 說明
+
+| Application ID
+| D2760001240100000006**34718416**0000 +
+包含序號 34718416
+
+| Version
+| OpenPGP 3.4（支援 RSA 4096）
+
+| Key attributes
+| rsa**2048** rsa**2048** rsa**2048** +
+預設為 RSA 2048，需升級到 4096
+
+| PIN retry counter
+| **3** 0 **3** +
+User PIN 剩餘 3 次，Admin PIN 剩餘 3 次
+
+| Signature/Encryption/Authentication key
+| [none] → 尚未儲存金鑰
+|===
+
+== 修改 YubiKey 金鑰屬性
+
+=== 為何需要修改？
+
+預設情況下，YubiKey OpenPGP 應用程式使用 RSA **2048** 位元金鑰，但我們的 GPG 金鑰是 RSA **4096** 位元。
+
+[source]
+----
+GPG 金鑰 (RSA 4096)  →  ✗ 不匹配  ←  YubiKey (RSA 2048 預設)
+
+必須先修改 YubiKey 支援 RSA 4096
+----
+
+=== 進入 Admin 模式修改金鑰屬性
+
+==== 啟動 gpg --card-edit
+
+[source,bash]
+----
+$ gpg --card-edit
+
+Reader ...........: Yubico YubiKey OTP FIDO CCID 0
+...
+gpg/card> admin
+Admin commands are allowed
+
+gpg/card> key-attr
+----
+
+==== 修改三個插槽的金鑰屬性
+
+[source]
+----
+Changing card key attribute for: Signature key
+Please select what kind of key you want:
+   (1) RSA
+   (2) ECC
+Your selection? 1
+
+What keysize do you want? (2048) 4096
+The card will now be re-configured to generate a key of 4096 bits
+
+Changing card key attribute for: Encryption key
+Please select what kind of key you want:
+   (1) RSA
+   (2) ECC
+Your selection? 1
+
+What keysize do you want? (2048) 4096
+
+Changing card key attribute for: Authentication key
+Please select what kind of key you want:
+   (1) RSA
+   (2) ECC
+Your selection? 1
+
+What keysize do you want? (2048) 4096
+----
+
+==== 驗證修改結果
+
+[source,bash]
+----
+gpg/card> list
+
+...
+Key attributes ...: rsa4096 rsa4096 rsa4096
+...
+
+gpg/card> quit
+----
+
+✓ 現在 YubiKey 支援 RSA 4096 位元金鑰
+
+== 備份 GPG 金鑰
+
+WARNING: 私鑰轉移到 YubiKey 後，本機的私鑰會被刪除。務必先備份！
+
+=== 匯出公鑰
+
+[source,bash]
+----
+$ gpg --export --armor 30B413E724701EA1 > ~/yubikey-public-key.asc
+----
+
+==== 公鑰內容結構
+
+[source,bash]
+----
+$ head -5 ~/yubikey-public-key.asc
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBGb8NhABEAC... (Base64 編碼的公鑰資料)
+...
+-----END PGP PUBLIC KEY BLOCK-----
+----
+
+==== 公鑰包含的資訊
+
+* 主金鑰公鑰（Signature + Certify）
+* 子金鑰公鑰（Encryption）
+* User ID（姓名、郵箱、註釋）
+* 自簽章（Self-signature）
+
+TIP: 公鑰可以自由分享，用於加密給你的訊息或驗證你的簽章。
+
+=== 匯出私鑰（用於備份）
+
+[source,bash]
+----
+$ gpg --export-secret-keys --armor 30B413E724701EA1 > ~/yubikey-private-key-backup.asc
+----
+
+WARNING: 私鑰檔案必須妥善保管，絕不可上傳到不安全的地方！
+
+==== 私鑰內容結構
+
+[source,bash]
+----
+$ head -5 ~/yubikey-private-key-backup.asc
+-----BEGIN PGP PRIVATE KEY BLOCK-----
+
+lQdGBGb8NhABEAC... (Base64 編碼的私鑰資料，包含加密保護)
+...
+-----END PGP PRIVATE KEY BLOCK-----
+----
+
+==== 私鑰保護機制
+
+預設情況下，GPG 私鑰使用 **passphrase** 加密保護：
+
+[source,bash]
+----
+$ gpg --list-packets ~/yubikey-private-key-backup.asc | head -20
+:secret key packet:
+	version 4, algo 1, created 1738320000, expires 0
+	skey[0]: [encrypted]  ← 私鑰加密儲存
+	skey[1]: [encrypted]
+	iter+salt S2K, algo: 9, SHA1 protection, hash: 2, salt: ...
+	protect count: 65011712 (255)
+	protect IV: ...
+----
+
+即使備份檔案被竊取，攻擊者仍需要你的 passphrase 才能使用私鑰。
+
+=== 產生註銷憑證
+
+註銷憑證用於在金鑰遺失或洩漏時廢止金鑰。
+
+[source,bash]
+----
+$ gpg --gen-revoke --armor --output ~/yubikey-revoke-cert.rev 30B413E724701EA1
+
+sec  rsa4096/30B413E724701EA1 2026-01-31 YubiKey User <user@example.com>
+
+Create a revocation certificate for this key? (y/N) y
+
+請選擇撤銷的理由：
+  0 = 沒有指定原因
+  1 = 金鑰已洩漏
+  2 = 金鑰被替換
+  3 = 金鑰已經不再使用
+  Q = 取消
+你的選擇？1
+
+請輸入選擇性的描述；以空白列結束：
+> Emergency revocation - key compromised
+> 
+已強制使用 ASCII 封裝過的輸出。
+撤銷憑證已建立。
+----
+
+==== 註銷憑證內容
+
+[source,bash]
+----
+$ cat ~/yubikey-revoke-cert.rev
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Comment: This is a revocation certificate
+
+iQI2BCABCAAgFiEE... (Base64 編碼的註銷簽章)
+...
+-----END PGP PUBLIC KEY BLOCK-----
+----
+
+IMPORTANT: 註銷憑證應與私鑰備份分開保管，並永久保存！
+
+=== 備份策略
+
+建議的備份策略：
+
+[cols="1,2,2"]
+|===
+| 檔案 | 存放位置 | 重要性
+
+| yubikey-public-key.asc
+| Bitwarden、GitHub、公鑰伺服器
+| 低風險（可公開）
+
+| yubikey-revoke-cert.rev
+| Bitwarden、加密 USB 隨身碟
+| **極重要**（遺失無法註銷金鑰）
+
+| yubikey-private-key-backup.asc
+| **加密 USB 隨身碟，離線保存** +
+銷毀紙本備份後的數位檔案
+| 高風險（應在轉移到 YubiKey 後安全銷毀）
+|===
+
+==== 安全銷毀私鑰備份
+
+[source,bash]
+----
+# 使用 shred 覆寫後刪除（防止資料恢復）
+$ shred -vfz -n 10 ~/yubikey-private-key-backup.asc
+
+shred: ~/yubikey-private-key-backup.asc: pass 1/10 (random)...
+shred: ~/yubikey-private-key-backup.asc: pass 2/10 (random)...
+...
+shred: ~/yubikey-private-key-backup.asc: pass 10/10 (000000)...
+shred: ~/yubikey-private-key-backup.asc: removing
+shred: ~/yubikey-private-key-backup.asc: renamed to 0000000000000000000000000000
+shred: ~/yubikey-private-key-backup.asc: removed
+----
+
+TIP: 只在確認兩個 YubiKey 都成功轉移金鑰後才銷毀備份！
+
+== 轉移金鑰到 YubiKey
+
+=== 理解金鑰結構
+
+在轉移前，需要理解 GPG 金鑰的結構：
+
+[source,bash]
+----
+$ gpg --list-keys --with-subkey-fingerprints 30B413E724701EA1
+
+pub   rsa4096/30B413E724701EA1 2026-01-31 [SC]
+      主金鑰 fingerprint: ABC123DEF456...
+uid                 [ultimate] YubiKey User <user@example.com>
+sub   rsa4096/987C1049CF851A3F 2026-01-31 [E]
+      子金鑰 fingerprint: DEF456GHI789...
+----
+
+[source]
+----
+GPG 金鑰結構:
+┌────────────────────────────┐
+│  主金鑰 (Primary Key)      │
+│  • ID: 30B413E724701EA1    │
+│  • 能力: [SC]              │
+│    - S: 簽署 (Sign)        │
+│    - C: 認證 (Certify)     │
+│  • 用於簽署其他金鑰        │
+└────────────┬───────────────┘
+             │
+             ├─► 子金鑰 1 (Subkey)
+             │   • ID: 987C1049CF851A3F
+             │   • 能力: [E]
+             │     - E: 加密 (Encrypt)
+             │   • 用於加密密碼
+             │   • ★ 本專案使用此金鑰 ★
+             │
+             └─► （可以有更多子金鑰）
+----
+
+=== 為何要編輯子金鑰？
+
+在 GPG 中，**子金鑰**（Subkey）和**主金鑰**（Primary Key）是分開管理的。
+
+==== 金鑰選擇邏輯
+
+[source]
+----
+預設情況（不選擇金鑰）:
+  gpg --edit-key 30B413E724701EA1
+  gpg> keytocard
+  → 只會移動主金鑰 [SC]
+  → 不會移動子金鑰 [E]
+
+正確做法（選擇子金鑰）:
+  gpg --edit-key 30B413E724701EA1
+  gpg> key 1         ← 選擇第一個子金鑰
+  gpg> keytocard     ← 移動選中的子金鑰 [E]
+----
+
+==== 為什麼需要輸入 `key 1`？
+
+[source]
+----
+問題：為什麼要進入 key 1 更深的一層？
+
+答案：
+1. GPG 的金鑰編輯模式預設操作主金鑰
+2. 子金鑰需要「選擇」(select) 後才能操作
+3. `key 1` 表示「選擇第一個子金鑰」
+4. 選擇後，`keytocard` 才會作用於子金鑰
+
+類比：
+就像檔案管理器中：
+  • 主金鑰是資料夾
+  • 子金鑰是資料夾內的檔案
+  • 你必須「點選」檔案，才能對它執行操作
+----
+
+=== 轉移主金鑰到 YubiKey
+
+==== 進入金鑰編輯模式
+
+[source,bash]
+----
+$ gpg --edit-key 30B413E724701EA1
+
+gpg (GnuPG) 2.4.4; Copyright (C) 2024 g10 Code GmbH
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+私鑰可用。
+
+sec  rsa4096/30B413E724701EA1
+     建立：2026-01-31  有效期：永不       使用：SC  
+     信任：徹底        有效性：徹底
+ssb  rsa4096/987C1049CF851A3F
+     建立：2026-01-31  有效期：永不       使用：E   
+[  徹底  ] (1). YubiKey User <user@example.com>
+
+gpg>
+----
+
+==== 移動主金鑰
+
+[source,bash]
+----
+gpg> keytocard
+Really move the primary key? (y/N) y
+Please select where to store the key:
+   (1) Signature key
+   (3) Authentication key
+Your selection? 1
+----
+
+[source]
+----
+解釋：
+• 主金鑰能力是 [SC]，適合用於簽署
+• 選擇插槽 1 (Signature key)
+• 需要輸入 Admin PIN: 12345678（預設）
+----
+
+==== 驗證主金鑰移動
+
+[source,bash]
+----
+gpg> list
+
+sec  rsa4096/30B413E724701EA1
+     建立：2026-01-31  有效期：永不       使用：SC  
+     卡片序號：0006 34718416
+                    ↑
+                主金鑰已在 YubiKey 上
+ssb  rsa4096/987C1049CF851A3F
+     建立：2026-01-31  有效期：永不       使用：E   
+     ↑
+  子金鑰尚在本機
+----
+
+=== 轉移子金鑰（加密金鑰）
+
+TIP: **這是最關鍵的步驟**，因為 pass 使用加密子金鑰來解密密碼！
+
+==== 選擇子金鑰
+
+[source,bash]
+----
+gpg> key 1
+
+sec  rsa4096/30B413E724701EA1
+     建立：2026-01-31  有效期：永不       使用：SC  
+     卡片序號：0006 34718416
+ssb* rsa4096/987C1049CF851A3F
+     建立：2026-01-31  有效期：永不       使用：E   
+     ↑
+   星號 (*) 表示已選擇
+----
+
+==== 為何是 `key 1`？
+
+[source]
+----
+GPG 金鑰編號邏輯:
+
+主金鑰 (Primary)     → 不需編號（預設選擇）
+第一個子金鑰 (Sub 1) → key 1
+第二個子金鑰 (Sub 2) → key 2
+第三個子金鑰 (Sub 3) → key 3
+...
+
+在我們的金鑰中:
+  主金鑰: 30B413E724701EA1 [SC]
+  子金鑰 1: 987C1049CF851A3F [E]  ← key 1
+  
+因此輸入 `key 1` 選擇加密子金鑰
+----
+
+==== 移動子金鑰到 YubiKey
+
+[source,bash]
+----
+gpg> keytocard
+Please select where to store the key:
+   (2) Encryption key
+Your selection? 2
+----
+
+[source]
+----
+解釋：
+• 子金鑰能力是 [E]（加密）
+• 選擇插槽 2 (Encryption key)
+• 需要輸入 Admin PIN: 12345678
+----
+
+==== 驗證轉移完成
+
+[source,bash]
+----
+gpg> list
+
+sec  rsa4096/30B413E724701EA1
+     建立：2026-01-31  有效期：永不       使用：SC  
+     卡片序號：0006 34718416
+ssb* rsa4096/987C1049CF851A3F
+     建立：2026-01-31  有效期：永不       使用：E   
+     卡片序號：0006 34718416
+                    ↑
+              子金鑰也在 YubiKey 上了
+
+gpg> save
+----
+
+TIP: `save` 命令會儲存變更並退出編輯模式。
+
+=== 驗證金鑰已在 YubiKey
+
+==== 使用 gpg --card-status
+
+[source,bash]
+----
+$ gpg --card-status
+Reader ...........: Yubico YubiKey OTP FIDO CCID 0
+...
+Key attributes ...: rsa4096 rsa4096 rsa4096
+...
+Signature key ....: ABC1 23DE F456 GHI7 89JK L012 MNO3 45PQ R678 ST90
+      created ....: 2026-01-31 08:30:00
+Encryption key ...: DEF4 56GH I789 JKL0 12MN O345 PQR6 78ST 9012 UV34
+      created ....: 2026-01-31 08:30:00
+Authentication key: [none]
+General key info..: 
+pub  rsa4096/30B413E724701EA1 2026-01-31 YubiKey User <user@example.com>
+sec>  rsa4096/30B413E724701EA1  建立：2026-01-31  有效期：永不
+                                卡片序號：0006 34718416
+ssb>  rsa4096/987C1049CF851A3F  建立：2026-01-31  有效期：永不
+                                卡片序號：0006 34718416
+----
+
+重要標記解析：
+
+[cols="1,3"]
+|===
+| 標記 | 意義
+
+| `sec>`
+| 主金鑰私鑰在智能卡上（`>` 表示卡片）
+
+| `ssb>`
+| 子金鑰私鑰在智能卡上
+
+| Signature key
+| 有 fingerprint → 主金鑰已儲存 ✓
+
+| Encryption key
+| 有 fingerprint → 子金鑰已儲存 ✓
+|===
+
+==== 檢查本機金鑰狀態
+
+[source,bash]
+----
+$ gpg --list-secret-keys --with-subkey-fingerprints 30B413E724701EA1
+
+sec>  rsa4096/30B413E724701EA1 2026-01-31 [SC]
+      主金鑰 fingerprint: ABC123...
+      Card serial no. = 0006 34718416
+uid                 [ultimate] YubiKey User <user@example.com>
+ssb>  rsa4096/987C1049CF851A3F 2026-01-31 [E]
+      子金鑰 fingerprint: DEF456...
+      Card serial no. = 0006 34718416
+----
+
+`sec>` 和 `ssb>` 的 `>` 符號表示私鑰不在本機，而在卡片上。
+
+==== 本機私鑰檔案的變化
+
+[source,bash]
+----
+# 金鑰轉移前
+$ ls -lh ~/.gnupg/private-keys-v1.d/
+-rw------- 1 jojo jojo 3.2K Jan 31 08:20 KEYGRIP_MAIN.key
+-rw------- 1 jojo jojo 3.2K Jan 31 08:20 KEYGRIP_SUB.key
+
+# 金鑰轉移後
+$ ls -lh ~/.gnupg/private-keys-v1.d/
+-rw------- 1 jojo jojo  340 Jan 31 09:00 KEYGRIP_MAIN.key
+-rw------- 1 jojo jojo  340 Jan 31 09:00 KEYGRIP_SUB.key
+----
+
+檔案大小從 3.2KB 變成 340 bytes，內容變為「卡片存根」(Card stub)：
+
+[source,bash]
+----
+$ cat ~/.gnupg/private-keys-v1.d/KEYGRIP_SUB.key
+(protected-private-key
+ (rsa
+  (n #00ABC123...#)
+  (e #010001#)
+  (shadowed t
+   (card-serial-number 0006 34718416))))
+   ↑
+ 表示私鑰已在序號 34718416 的卡片上
+----
+
+== 雙 YubiKey 備份策略
+
+=== 為何需要雙 YubiKey？
+
+[source]
+----
+單一 YubiKey 的風險:
+  ┌────────────┐
+  │  YubiKey   │
+  │  (唯一)    │
+  └──────┬─────┘
+         │
+         ├─► 遺失 → 無法解密密碼 ✗
+         ├─► 損壞 → 無法解密密碼 ✗
+         └─► 韌體錯誤 → 無法解密密碼 ✗
+
+雙 YubiKey 備份:
+  ┌────────────┐     ┌────────────┐
+  │  YubiKey 1 │     │  YubiKey 2 │
+  │  (主要)    │     │  (備份)    │
+  └──────┬─────┘     └──────┬─────┘
+         │                  │
+         └──────────────────┘
+         兩個完全相同的金鑰副本
+         任一個都可以解密密碼 ✓
+----
+
+=== 轉移金鑰到第二個 YubiKey
+
+==== 前置條件
+
+1. 第一個 YubiKey 金鑰已轉移完成
+2. 私鑰備份檔案還在（`yubikey-private-key-backup.asc`）
+3. 第二個 YubiKey 已修改金鑰屬性為 RSA 4096
+
+==== 恢復私鑰到本機
+
+[source,bash]
+----
+# 從備份恢復私鑰
+$ gpg --import ~/yubikey-private-key-backup.asc
+gpg: 金鑰 30B413E724701EA1: "YubiKey User <user@example.com>" 未變更
+gpg: 金鑰 30B413E724701EA1: 私鑰已匯入
+gpg: 處理總量：1
+gpg:             未變更：1
+gpg:       讀取私鑰：1
+gpg:       匯入私鑰：1
+----
+
+==== 插入第二個 YubiKey
+
+[source,bash]
+----
+# 確認是第二個 YubiKey
+$ gpg --card-status | grep "Serial"
+Serial number ....: 34718432
+                           ↑
+                      不同的序號
+----
+
+==== 重複轉移流程
+
+[source,bash]
+----
+$ gpg --edit-key 30B413E724701EA1
+
+# 轉移主金鑰
+gpg> keytocard
+Really move the primary key? (y/N) y
+Your selection? 1  # Signature key
+
+# 選擇並轉移子金鑰
+gpg> key 1
+gpg> keytocard
+Your selection? 2  # Encryption key
+
+gpg> save
+----
+
+==== 驗證第二個 YubiKey
+
+[source,bash]
+----
+$ gpg --card-status
+Serial number ....: 34718432
+...
+Signature key ....: ABC1 23DE F456 ...  ← 相同的 fingerprint
+Encryption key ...: DEF4 56GH I789 ...  ← 相同的 fingerprint
+----
+
+✓ 兩個 YubiKey 現在儲存相同的金鑰副本
+
+=== 測試雙 YubiKey 切換
+
+==== 測試 YubiKey 1
+
+[source,bash]
+----
+# 插入 YubiKey 1 (34718416)
+$ gpg --card-status | grep "Serial"
+Serial number ....: 34718416
+
+# 測試解密
+$ pass show vpn/fortigate
+[輸入 PIN]
+your_actual_password  ← 成功 ✓
+----
+
+==== 移除 YubiKey 1，測試 YubiKey 2
+
+[source,bash]
+----
+# 移除 YubiKey 1，插入 YubiKey 2 (34718432)
+$ gpg --card-status | grep "Serial"
+Serial number ....: 34718432
+
+# 重新啟動 gpg-agent（清除快取）
+$ gpg-connect-agent reloadagent /bye
+
+# 測試解密
+$ pass show vpn/fortigate
+[輸入 PIN]
+your_actual_password  ← 成功 ✓
+----
+
+✓ 雙 YubiKey 備份策略驗證成功！
+
+== Admin PIN 的作用
+
+=== PIN 層級結構
+
+YubiKey OpenPGP 應用程式有兩個 PIN：
+
+[source]
+----
+┌─────────────────────────────────┐
+│  YubiKey OpenPGP PIN 結構       │
+├─────────────────────────────────┤
+│                                 │
+│  層級 1: User PIN              │
+│  • 預設: 123456                │
+│  • 用於: 日常使用（解密、簽署） │
+│  • 嘗試次數: 3 次               │
+│  • 錯誤 3 次後: 鎖定 User PIN   │
+│                                 │
+│  ─────────────────────────────  │
+│                                 │
+│  層級 2: Admin PIN             │
+│  • 預設: 12345678              │
+│  • 用於: 管理操作（金鑰寫入、   │
+│          重置 User PIN）        │
+│  • 嘗試次數: 3 次               │
+│  • 錯誤 3 次後: 完全鎖定        │
+│  • 權限: 可以重置 User PIN      │
+│                                 │
+└─────────────────────────────────┘
+----
+
+=== 為何需要 Admin PIN？
+
+==== 權限分離原則
+
+[source]
+----
+類比：Linux 系統權限
+
+User PIN     = 一般使用者權限
+  • 可以讀取檔案（解密）
+  • 可以寫入檔案（簽署）
+  • 不能修改系統設定
+
+Admin PIN    = root/sudo 權限
+  • 可以安裝軟體（寫入金鑰）
+  • 可以修改系統設定（修改金鑰屬性）
+  • 可以重置使用者密碼（重置 User PIN）
+----
+
+==== Admin PIN 的使用場景
+
+[cols="1,2,1"]
+|===
+| 操作 | 需要的 PIN | 原因
+
+| 解密密碼
+| User PIN
+| 日常使用
+
+| 簽署資料
+| User PIN
+| 日常使用
+
+| **寫入金鑰到 YubiKey**
+| **Admin PIN**
+| 管理操作
+
+| **修改金鑰屬性（2048→4096）**
+| **Admin PIN**
+| 管理操作
+
+| **重置 User PIN**
+| **Admin PIN**
+| 安全恢復
+
+| **修改 cardholder 名稱**
+| Admin PIN
+| 管理操作
+|===
+
+=== Admin PIN 實際使用範例
+
+==== keytocard 命令中的 Admin PIN
+
+[source,bash]
+----
+gpg> keytocard
+Really move the primary key? (y/N) y
+
+請輸入智能卡的 Admin PIN
+         ↓
+┌─────────────────────────────────┐
+│ Please enter the Admin PIN      │
+│                                  │
+│ PIN: ________                    │
+│                                  │
+│      [確定]      [取消]          │
+└─────────────────────────────────┘
+         ↓
+輸入: 12345678 (預設 Admin PIN)
+         ↓
+金鑰寫入 YubiKey ✓
+----
+
+==== key-attr 命令中的 Admin PIN
+
+[source,bash]
+----
+gpg/card> key-attr
+...
+What keysize do you want? (2048) 4096
+
+請輸入智能卡的 Admin PIN
+         ↓
+輸入: 12345678
+         ↓
+金鑰屬性已修改為 RSA 4096 ✓
+----
+
+=== 修改預設 PIN
+
+WARNING: 預設 PIN 不安全，建議修改！
+
+==== 修改 User PIN
+
+[source,bash]
+----
+$ gpg --card-edit
+
+gpg/card> passwd
+
+1 - change PIN        ← 修改 User PIN
+2 - unblock PIN       ← 使用 Admin PIN 解鎖 User PIN
+3 - change Admin PIN  ← 修改 Admin PIN
+Q - quit
+
+Your selection? 1
+
+請輸入 PIN
+PIN: 123456  ← 舊 PIN
+
+新的 PIN
+PIN: 987654  ← 新 PIN（至少 6 位）
+
+新的 PIN
+PIN: 987654  ← 確認新 PIN
+
+PIN changed.
+----
+
+==== 修改 Admin PIN
+
+[source,bash]
+----
+gpg/card> passwd
+
+Your selection? 3
+
+請輸入 Admin PIN
+Admin PIN: 12345678  ← 舊 Admin PIN
+
+新的 Admin PIN
+Admin PIN: 87654321  ← 新 Admin PIN（至少 8 位）
+
+新的 Admin PIN
+Admin PIN: 87654321  ← 確認新 Admin PIN
+
+Admin PIN changed.
+
+gpg/card> quit
+----
+
+TIP: 兩個 YubiKey 建議使用相同的 PIN，方便切換使用。
+
+== 故障排除
+
+=== YubiKey 未被識別
+
+==== 檢查清單
+
+[source,bash]
+----
+# 1. 檢查 USB 裝置
+$ lsusb | grep Yubico
+# 如果沒有輸出 → 檢查 VMware USB 設置
+
+# 2. 檢查 pcscd 服務
+$ systemctl status pcscd
+# 如果未啟動 → sudo systemctl start pcscd
+
+# 3. 檢查 GPG 識別
+$ gpg --card-status
+# 如果錯誤 → 重新啟動 gpg-agent 和 scdaemon
+
+# 4. 重新啟動相關服務
+$ gpg-connect-agent "SCD KILLSCD" "SCD BYE" /bye
+$ gpg-connect-agent reloadagent /bye
+$ sudo systemctl restart pcscd
+----
+
+=== PIN 錯誤次數過多
+
+==== 檢查剩餘次數
+
+[source,bash]
+----
+$ gpg --card-status | grep "PIN retry"
+PIN retry counter : 0 0 3
+                    ↑ ↑ ↑
+                    │ │ └─ Admin PIN: 3 次
+                    │ └─── Reset Code: 0 次（未設置）
+                    └───── User PIN: 0 次（已鎖定！）
+----
+
+==== 使用 Admin PIN 解鎖 User PIN
+
+[source,bash]
+----
+$ gpg --card-edit
+
+gpg/card> passwd
+
+Your selection? 2  # unblock PIN
+
+請輸入 Admin PIN
+Admin PIN: 12345678
+
+新的 PIN
+PIN: 123456  # 設定新的 User PIN
+
+User PIN unblocked and changed.
+----
+
+==== Admin PIN 也鎖定的情況
+
+如果 Admin PIN 也錯誤 3 次：
+
+[source,bash]
+----
+PIN retry counter : 0 0 0
+                        ↑
+                    Admin PIN 也鎖定了
+
+→ 必須完全重置 OpenPGP 應用程式
+→ 所有金鑰將被清除！
+----
+
+重置方法（使用 YubiKey Manager）：
+
+[source,bash]
+----
+# 方法 1: ykman CLI (Linux)
+$ ykman openpgp reset
+WARNING: This will delete all stored OpenPGP keys and data and restore factory settings?
+[y/N]: y
+Resetting OpenPGP data, don't remove the YubiKey...
+Success! All data has been cleared and default PINs are set.
+
+# 方法 2: YubiKey Manager GUI (Windows)
+Applications → OpenPGP → Reset
+----
+
+IMPORTANT: 重置後需要重新轉移金鑰（從備份恢復）。
+
+=== keytocard 失敗
+
+==== 錯誤：金鑰屬性不匹配
+
+[source,bash]
+----
+gpg> keytocard
+gpg: error writing key to card: Bad secret key
+----
+
+**原因**：YubiKey 金鑰屬性仍是 RSA 2048
+
+**解決**：先修改金鑰屬性為 RSA 4096
+
+[source,bash]
+----
+gpg/card> key-attr
+# 將三個插槽都改為 RSA 4096
+----
+
+==== 錯誤：插槽已被佔用
+
+[source,bash]
+----
+gpg> keytocard
+gpg: existing key will be replaced
+Replace existing key? (y/N) y
+----
+
+如果不想覆蓋，先重置 OpenPGP 應用程式。
+
+== 小結
+
+=== 關鍵要點
+
+1. **YubiKey OpenPGP 應用程式**：智能卡標準，支援 RSA 4096
+2. **三個金鑰插槽**：Signature, Encryption, Authentication
+3. **金鑰屬性必須匹配**：預設 2048 需升級到 4096
+4. **`key 1` 選擇子金鑰**：預設只操作主金鑰
+5. **Admin PIN 用於管理**：寫入金鑰、修改屬性、重置 User PIN
+6. **雙 YubiKey 備份**：從備份恢復私鑰，轉移到第二個 YubiKey
+7. **私鑰不可匯出**：轉移後應安全銷毀本機備份
+
+=== 驗證清單
+
+轉移完成後檢查：
+
+- [ ] `gpg --card-status` 顯示 Signature key 和 Encryption key
+- [ ] `gpg --list-secret-keys` 顯示 `sec>` 和 `ssb>`
+- [ ] 本機 private-keys-v1.d/*.key 變為 340 bytes（卡片存根）
+- [ ] `pass show vpn/fortigate` 可成功解密（輸入 User PIN）
+- [ ] 第二個 YubiKey 也可解密（雙備份驗證）
+
+=== 下一章預告
+
+link:03-vpn-automation.adoc[下一章] 將探討：
+
+* 如何整合 pass 與 openfortivpn
+* VPN 自動連接腳本的實作
+* YubiKey 自動偵測機制
+* Background process 的 sudo 權限處理
+
+---
+
+link:01-openpgp-encryption.adoc[← 上一章：OpenPGP 加密] | link:00-overview.adoc[返回總覽] | link:03-vpn-automation.adoc[下一章：VPN 自動化 →]

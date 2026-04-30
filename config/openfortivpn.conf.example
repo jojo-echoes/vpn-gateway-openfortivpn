@@ -1,0 +1,30 @@
+# /etc/openfortivpn/config
+# Permissions: chmod 0600 ; owner root:root
+#
+# 完整選項：man openfortivpn
+
+### --- 連線目標（依公司 FortiGate 填入） ---
+host = vpn.example.com
+port = 443
+username = your_user
+# 建議用 password 而非 password-file；或刪掉這行讓它互動式詢問
+password = your_password
+
+# 從第一次連線錯誤訊息中複製 SHA-256 fingerprint（必填，用來釘選憑證）
+trusted-cert = 0000000000000000000000000000000000000000000000000000000000000000
+
+### --- 關鍵：禁止綁架本機路由 / DNS ---
+# 不要把 server 推的 routes 寫進系統路由表（包含 default route）
+set-routes = 0
+# 不要動 /etc/resolv.conf
+set-dns = 0
+# 不要接受 pppd peer DNS
+pppd-use-peerdns = 0
+# 不要讓 pppd 把 ppp0 設成 default route
+pppd-no-peerdns = 1
+
+### --- 其他 ---
+# half-internet-routes 在 set-routes=0 時無作用，留 0 即可
+half-internet-routes = 0
+# pppd 日誌（除錯時很有用）
+pppd-log = /var/log/pppd.log

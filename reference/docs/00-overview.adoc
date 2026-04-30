@@ -1,0 +1,320 @@
+= YubiKey + OpenPGP + FortiGate VPN 自動化系統 - 總覽
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+
+== 專案概述
+
+本文件系列記錄了一個完整的企業級 VPN 自動化解決方案的開發過程，整合了以下技術：
+
+* **OpenPGP (GPG 2.4.4)**: 提供非對稱加密的密碼管理
+* **YubiKey 5C NFC**: 硬體安全金鑰，儲存私鑰並提供雙因素認證
+* **pass (Unix Password Manager)**: 基於 GPG 的密碼管理工具
+* **openfortivpn**: FortiGate SSL VPN 客戶端
+* **Bash 自動化腳本**: 智能偵測 YubiKey 並提供自動/手動雙模式
+
+=== 系統架構
+
+[source]
+----
+┌─────────────┐
+│  YubiKey    │  ◄─── 私鑰儲存（RSA 4096）
+│  5C NFC x2  │       需要 PIN 解鎖
+└──────┬──────┘
+       │
+       ▼
+┌─────────────────┐
+│  GPG Agent      │  ◄─── PIN 快取（10 分鐘）
+│  (gpg-agent)    │       處理加密/解密
+└──────┬──────────┘
+       │
+       ▼
+┌─────────────────┐
+│  pass           │  ◄─── 密碼管理器
+│  (password-     │       ~/.password-store/
+│   store)        │       vpn/fortigate.gpg
+└──────┬──────────┘
+       │
+       ▼
+┌─────────────────┐
+│  connect-vpn.sh │  ◄─── 智能偵測腳本
+│                 │       • 有 YubiKey: 自動模式
+│                 │       • 無 YubiKey: 手動模式
+└──────┬──────────┘
+       │
+       ▼
+┌─────────────────┐
+│  openfortivpn   │  ◄─── FortiGate VPN 客戶端
+│                 │       連接到企業 VPN
+└─────────────────┘
+----
+
+=== 核心特性
+
+==== 1. 硬體級安全
+* 私鑰永不離開 YubiKey（無法導出）
+* RSA 4096 位元金鑰
+* 雙 YubiKey 冗餘備份
+* PIN 保護（3 次錯誤後鎖定）
+
+==== 2. 智能自動化
+* 自動偵測 YubiKey 存在
+* YubiKey 模式：全自動背景執行
+* 手動模式：screen 會話互動輸入
+* 無縫切換，無需修改設定
+
+==== 3. 企業級功能
+* Server-pushed routes（由 FortiGate 管理路由）
+* Split tunneling（保持原有網路存取）
+* PID 追蹤（可靠的連接/中斷控制）
+* Trap 清理機制（確保臨時檔案清理）
+
+=== 開發環境
+
+[cols="1,3"]
+|===
+| 項目 | 規格
+
+| 作業系統
+| Ubuntu 24.04 LTS (Kernel 6.8.0-90-generic)
+
+| 虛擬化
+| VMware Workstation with USB 3.1 passthrough
+
+| 硬體
+| YubiKey 5C NFC (Firmware 5.7.4) x 2 +
+Serial: 34718416, 34718432
+
+| GPG
+| 2.4.4 (libgcrypt 1.10.3) +
+RSA 4096-bit key (ID: 30B413E724701EA1)
+
+| 工具
+| pass 1.7.4-6, openfortivpn, pcscd, scdaemon +
+screen, nohup, bash
+
+| VPN
+| FortiGate SSL VPN (163.17.117.94:34401) +
+Split tunneling enabled
+|===
+
+=== 文件結構
+
+本文件系列包含以下章節：
+
+[cols="1,2,3"]
+|===
+| 文件 | 主題 | 內容
+
+| link:01-openpgp-encryption.adoc[01. OpenPGP 加密機制]
+| OpenPGP 運作原理
+| • GPG 金鑰產生與管理 +
+• 密碼加密與解密流程 +
+• 加密驗證方法
+
+| link:02-yubikey-integration.adoc[02. YubiKey 整合]
+| YubiKey 與 OpenPGP 整合
+| • YubiKey OpenPGP 應用程式 +
+• 私鑰轉移到智能卡 +
+• 雙 YubiKey 備份策略
+
+| link:03-vpn-automation.adoc[03. VPN 自動化]
+| OpenPGP + openfortivpn 整合
+| • pass 密碼管理器設置 +
+• VPN 腳本實作 +
+• 自動化連接流程
+
+| link:04-manual-mode.adoc[04. 手動輸入模式]
+| screen 方案設計
+| • 為何需要 screen +
+• 互動式密碼輸入 +
+• 背景執行管理
+
+| link:05-complete-workflow.adoc[05. 完整工作流程]
+| 日常使用與故障排除
+| • 完整操作流程 +
+• 常見問題解決 +
+• 安全最佳實踐
+|===
+
+=== 開發歷程重點
+
+==== 關鍵挑戰與解決方案
+
+1. **VPN 路由問題**
+   * 問題：手動管理路由導致維護困難
+   * 解決：啟用 `set-routes = 1` 接受 server-pushed routes
+
+2. **YubiKey 識別問題**
+   * 問題：VMware USB 2.0 無法可靠識別智能卡
+   * 解決：升級到 USB 3.1 控制器 + udev 規則
+
+3. **GPG 金鑰產生逾時**
+   * 問題：預設 gpg-agent timeout 為 0
+   * 解決：設定 `pinentry-timeout 120` 並理解現代 Linux entropy
+
+4. **背景執行密碼提示**
+   * 問題：nohup/背景執行無法輸入密碼
+   * 解決：(a) YubiKey 模式使用 pipe；(b) 手動模式使用 screen
+
+5. **sudo 權限問題**
+   * 問題：背景執行時 sudo 要求密碼
+   * 解決：使用 `sudo -v` 預先驗證
+
+6. **臨時檔案清理**
+   * 問題：異常退出時臨時檔案殘留
+   * 解決：實作 trap 清理機制
+
+=== 安全考量
+
+==== 威脅模型
+
+本系統防護以下威脅：
+
+* ✓ 密碼明文儲存在檔案系統
+* ✓ 密碼在記憶體中明文存在時間過長
+* ✓ 私鑰被惡意程式竊取
+* ✓ 單一金鑰遺失或損壞
+* ✓ 腳本歷史記錄洩漏密碼
+
+==== 安全邊界
+
+本系統**無法**防護：
+
+* ✗ Root 權限的惡意程式（可攔截記憶體）
+* ✗ 鍵盤記錄器（可攔截 PIN 輸入）
+* ✗ 物理存取+知道 PIN 的攻擊者
+* ✗ YubiKey 本身的韌體漏洞
+
+=== 成果展示
+
+==== 自動模式連接
+
+[source,bash]
+----
+$ bash ./connect-vpn.sh
+==========================================
+Fortigate VPN 連接腳本
+==========================================
+
+=== 連接前的網路狀態 ===
+當前 IP: 192.168.89.130
+預設閘道: 192.168.89.1 (介面: ens33)
+LAN 網段: 192.168.89.0/24
+
+=== 檢測 YubiKey/GPG 密碼管理器 ===
+✓ 已檢測到 YubiKey
+⚠️  請準備輸入 PIN（如果需要）
+✓ 已從 pass 取得密碼
+
+=== 啟動 VPN 連接 ===
+使用 YubiKey 自動連接...
+⚠️  需要 sudo 權限啟動 VPN
+✓ VPN 介面 ppp0 已建立
+VPN IP: 10.212.134.100/32
+
+=== Server 推送的路由 ===
+140.128.0.0/16 dev ppp0 scope link
+163.17.38.0/24 dev ppp0 scope link
+...
+
+✓ VPN 連接完成（由 Fortigate Server 管理路由）
+==========================================
+----
+
+==== 密碼加密驗證
+
+[source,bash]
+----
+$ gpg --list-packets ~/.password-store/vpn/fortigate.gpg
+:pubkey enc packet: version 3, algo 1, keyid 987C1049CF851A3F
+	data: [4095 bits]
+:encrypted data packet:
+	length: 124
+	mdc_method: 2
+gpg: encrypted with rsa4096 key, ID 987C1049CF851A3F
+# off=0 ctb=c1 tag=1 hlen=3 plen=525 new-ctb
+:pubkey enc packet: version 3, algo 1, keyid 987C1049CF851A3F
+	data: [4095 bits]
+# off=528 ctb=d2 tag=18 hlen=2 plen=124 new-ctb
+:encrypted data packet:
+	length: 124
+	mdc_method: 2
+:compressed packet: algo=2
+:literal data packet:
+	mode b (62), created 0, name="",
+	raw data: 17 bytes
+----
+
+✓ 使用 RSA 4096 位元金鑰加密 +
+✓ AEAD (Authenticated Encryption) 機制 +
+✓ 密碼長度 17 bytes（含換行符）
+
+=== 預期讀者
+
+本文件適合以下讀者：
+
+* 系統管理員：需要部署企業 VPN 自動化
+* 資訊安全專業人員：了解硬體安全金鑰整合
+* DevOps 工程師：學習 GPG + pass 密碼管理
+* Linux 進階使用者：研究 Bash 自動化與 screen 應用
+
+=== 前置知識
+
+建議具備以下背景知識：
+
+* Linux 指令列操作（檔案系統、程序管理）
+* 基礎網路概念（路由、VPN、Split tunneling）
+* 公鑰加密原理（非對稱加密、數位簽章）
+* Bash 腳本基礎（變數、條件判斷、迴圈）
+
+=== 閱讀順序建議
+
+==== 對於初學者
+建議依序閱讀所有文件：
+
+1. 總覽（本文件）→ 理解整體架構
+2. OpenPGP 加密機制 → 理解加密原理
+3. YubiKey 整合 → 理解硬體安全
+4. VPN 自動化 → 理解系統整合
+5. 手動輸入模式 → 理解容錯設計
+6. 完整工作流程 → 實際操作
+
+==== 對於有經驗的讀者
+可根據需求跳讀：
+
+* 只關注 YubiKey：閱讀文件 2
+* 只關注 VPN 自動化：閱讀文件 3 和 5
+* 只關注 screen 設計：閱讀文件 4
+
+=== 版本資訊
+
+[cols="1,2,3"]
+|===
+| 版本 | 日期 | 說明
+
+| 1.0
+| 2026-02-01
+| 初版發布 - 完整記錄開發過程
+|===
+
+=== 授權與使用
+
+本文件基於實際專案開發過程撰寫，適用於教育與技術研究用途。
+
+實作程式碼位於：`/home/jojo/netbox-automation/scripts/`
+
+=== 致謝
+
+感謝在開發過程中提供的技術支援與除錯協助，包括：
+
+* OpenPGP/GnuPG 社群的詳細文件
+* YubiKey 官方技術文件與工具
+* openfortivpn 專案的開源貢獻
+* pass 專案對 GPG 整合的優雅實現
+
+---
+
+**下一章**: link:01-openpgp-encryption.adoc[OpenPGP 加密機制與實作]

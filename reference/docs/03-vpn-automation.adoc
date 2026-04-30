@@ -1,0 +1,1116 @@
+= VPN 自動化整合實作
+:toc: left
+:toclevels: 4
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+
+link:02-yubikey-integration.adoc[← 上一章：YubiKey 整合] | link:00-overview.adoc[返回總覽] | link:04-manual-mode.adoc[下一章：手動輸入模式 →]
+
+== 章節簡介
+
+本章探討如何將 OpenPGP + YubiKey 系統整合到 FortiGate VPN 自動化中，包括：
+
+* openfortivpn 的運作原理與設定
+* pass 與 openfortivpn 的整合
+* YubiKey 自動偵測機制
+* 背景程序的 sudo 權限處理
+* PID 追蹤與連接管理
+
+== openfortivpn 簡介
+
+=== 什麼是 openfortivpn？
+
+`openfortivpn` 是一個開源的 FortiGate SSL VPN 客戶端，用於連接 FortiGate 防火牆提供的企業 VPN。
+
+==== 主要特性
+
+[cols="1,3"]
+|===
+| 特性 | 說明
+
+| SSL VPN
+| 基於 HTTPS/TLS 的 VPN 協定
+
+| PPP 介面
+| 建立 ppp0 虛擬網路介面
+
+| Server-pushed routes
+| 接受伺服器推送的路由表
+
+| Split tunneling
+| 僅特定流量走 VPN，不影響本機網路
+
+| 密碼驗證
+| 支援從標準輸入讀取密碼
+|===
+
+=== 安裝 openfortivpn
+
+[source,bash]
+----
+$ sudo apt update
+$ sudo apt install openfortivpn
+----
+
+==== 驗證安裝
+
+[source,bash]
+----
+$ openfortivpn --version
+openfortivpn 1.20.4
+
+$ which openfortivpn
+/usr/bin/openfortivpn
+----
+
+== FortiGate VPN 設定
+
+=== 設定檔結構
+
+openfortivpn 使用設定檔來儲存連接參數。
+
+==== 建立設定檔
+
+[source,bash]
+----
+$ cd ~/netbox-automation/scripts
+$ vi fortigate.conf
+----
+
+==== 設定檔內容
+
+[source,ini]
+----
+# FortiGate VPN 伺服器設定
+host = 163.17.117.94
+port = 34401
+username = jojoboyx
+# password = <不要寫在這裡！>
+
+# 路由設定
+set-routes = 1              # 接受 server-pushed routes
+half-internet-routes = 0    # 不使用半網際網路路由
+pppd-use-peerdns = 0        # 不使用 VPN 的 DNS
+pppd-log = /tmp/pppd.log    # pppd 日誌位置
+
+# 安全設定
+trusted-cert = 1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r9s0t1u2v3w4x5y6z7a8b9c0d1e2f
+----
+
+==== 設定項目說明
+
+[cols="1,2,2"]
+|===
+| 參數 | 值 | 說明
+
+| host
+| 163.17.117.94
+| FortiGate 伺服器 IP
+
+| port
+| 34401
+| SSL VPN 埠號
+
+| username
+| jojoboyx
+| VPN 帳號
+
+| set-routes
+| 1
+| **關鍵**：接受伺服器推送的路由表
+
+| half-internet-routes
+| 0
+| 不使用半網際網路路由（保留本機路由）
+
+| trusted-cert
+| (fingerprint)
+| 信任的伺服器憑證指紋
+|===
+
+IMPORTANT: `set-routes = 1` 是本專案的核心修正，之前設為 0 導致需手動管理路由。
+
+=== 為何使用 Server-pushed routes？
+
+==== 傳統手動路由管理
+
+[source,bash]
+----
+# 錯誤做法：set-routes = 0
+# 需要手動添加每條路由
+
+sudo ip route add 140.128.0.0/16 dev ppp0
+sudo ip route add 163.17.38.0/24 dev ppp0
+sudo ip route add 210.69.115.0/24 dev ppp0
+...（數十條路由）
+----
+
+問題：
+
+* 路由表變更時需修改腳本
+* 容易遺漏或錯誤
+* 不符合企業 VPN 最佳實踐
+
+==== Server-pushed routes（正確做法）
+
+[source,bash]
+----
+# 正確做法：set-routes = 1
+# FortiGate 自動推送所有需要的路由
+
+# VPN 連接後，自動建立：
+140.128.0.0/16 dev ppp0 scope link
+163.17.38.0/24 dev ppp0 scope link
+210.69.115.0/24 dev ppp0 scope link
+...（由 FortiGate 管理）
+----
+
+優點：
+
+* IT 管理員在伺服器端統一管理
+* 路由表變更自動同步
+* 減少客戶端維護成本
+
+=== Split Tunneling 驗證
+
+==== 連接前的路由表
+
+[source,bash]
+----
+$ ip route
+default via 192.168.89.1 dev ens33 proto dhcp metric 100
+192.168.89.0/24 dev ens33 proto kernel scope link src 192.168.89.130 metric 100
+----
+
+本機網路：192.168.89.0/24
+
+==== 連接後的路由表
+
+[source,bash]
+----
+$ ip route
+default via 192.168.89.1 dev ens33 proto dhcp metric 100  ← 保留預設路由
+192.168.89.0/24 dev ens33 proto kernel scope link src 192.168.89.130 metric 100
+
+# VPN 路由（由 FortiGate 推送）
+140.128.0.0/16 dev ppp0 scope link
+163.17.38.0/24 dev ppp0 scope link
+163.17.117.0/24 dev ppp0 scope link
+210.69.115.0/24 dev ppp0 scope link
+...
+----
+
+✓ 預設閘道保持 192.168.89.1（本機） +
+✓ 僅企業網段走 VPN（ppp0） +
+✓ 對外連線仍使用本機網路
+
+==== 驗證 Split Tunneling
+
+[source,bash]
+----
+# 測試本機網路（不走 VPN）
+$ ping 192.168.89.1
+PING 192.168.89.1 (192.168.89.1) 56(84) bytes of data.
+64 bytes from 192.168.89.1: icmp_seq=1 ttl=64 time=0.5 ms
+
+# 測試企業網路（走 VPN）
+$ ping 163.17.38.238
+PING 163.17.38.238 (163.17.38.238) 56(84) bytes of data.
+64 bytes from 163.17.38.238: icmp_seq=1 ttl=64 time=25 ms
+
+# 測試外部網路（不走 VPN）
+$ curl -s ifconfig.me
+125.228.185.16  ← 本機的公開 IP（不是 VPN IP）
+----
+
+== pass 與 openfortivpn 整合
+
+=== openfortivpn 的密碼輸入
+
+==== 標準互動式輸入
+
+[source,bash]
+----
+$ sudo openfortivpn -c fortigate.conf
+VPN account password: ________  ← 需要手動輸入
+----
+
+問題：
+
+* 無法自動化
+* 背景執行時會卡住
+* 不適合定期排程
+
+==== 從標準輸入讀取
+
+openfortivpn 支援從 stdin 讀取密碼：
+
+[source,bash]
+----
+$ echo "your_password" | sudo openfortivpn -c fortigate.conf
+----
+
+這為自動化提供了可能性。
+
+=== 整合 pass 與 openfortivpn
+
+==== 基本整合
+
+[source,bash]
+----
+# 方案：使用 pass 提供密碼給 openfortivpn
+$ pass show vpn/fortigate | sudo openfortivpn -c fortigate.conf
+----
+
+==== 執行流程
+
+[source]
+----
+步驟 1: pass show vpn/fortigate
+   ↓
+   • 讀取 ~/.password-store/vpn/fortigate.gpg
+   • 呼叫 gpg --decrypt
+   • gpg-agent 檢查快取
+   • 如果需要，要求 YubiKey PIN
+   • 輸出明文密碼到 stdout
+   ↓
+步驟 2: | (管道)
+   ↓
+   • 將 pass 的 stdout 傳遞給下一個命令的 stdin
+   ↓
+步驟 3: sudo openfortivpn -c fortigate.conf
+   ↓
+   • openfortivpn 從 stdin 讀取密碼
+   • 連接 FortiGate 伺服器
+   • 驗證帳號密碼
+   • 建立 ppp0 介面
+   • 接收 server-pushed routes
+----
+
+==== 權限問題
+
+openfortivpn 需要 root 權限（建立網路介面、修改路由表）：
+
+[source,bash]
+----
+# 問題：sudo 會切換到 root 環境
+$ pass show vpn/fortigate | sudo openfortivpn -c fortigate.conf
+                             ↑
+                    root 無法存取當前使用者的 GPG agent
+----
+
+解決：使用 bash 保持當前環境
+
+[source,bash]
+----
+$ pass show vpn/fortigate | sudo bash -c 'cat | openfortivpn -c /path/to/fortigate.conf'
+                                     ↑
+                          在子 shell 中執行，保留管道
+----
+
+簡化寫法：
+
+[source,bash]
+----
+$ sudo bash -c "pass vpn/fortigate | openfortivpn -c /path/to/fortigate.conf"
+----
+
+== VPN 自動化腳本設計
+
+=== 腳本架構
+
+[source]
+----
+connect-vpn.sh 架構：
+
+1. 環境檢查
+   ├─ 檢查 fortigate.conf
+   ├─ 檢查 screen
+   └─ 檢查 ppp0 是否已連接
+
+2. 網路狀態偵測
+   ├─ 取得當前 IP
+   ├─ 取得預設閘道
+   └─ 推測 LAN 網段
+
+3. YubiKey 偵測
+   ├─ 檢查 pass 是否安裝
+   ├─ 檢查 YubiKey 是否插入（gpg --card-status）
+   └─ 嘗試讀取密碼（pass show）
+
+4. VPN 啟動
+   ├─ 如果有 YubiKey：自動模式（nohup + pass pipe）
+   └─ 如果無 YubiKey：手動模式（screen + 互動輸入）
+
+5. 連接驗證
+   ├─ 等待 ppp0 介面建立
+   ├─ 顯示 VPN IP
+   ├─ 顯示 server-pushed routes
+   └─ 測試連接（ping Cisco 設備）
+----
+
+=== YubiKey 自動偵測
+
+==== 偵測邏輯
+
+[source,bash]
+----
+# 步驟 1: 檢查 pass 是否安裝
+if command -v pass >/dev/null 2>&1; then
+    echo "=== 檢測 YubiKey/GPG 密碼管理器 ==="
+    
+    # 步驟 2: 檢查 YubiKey 硬體
+    if gpg --card-status &>/dev/null; then
+        echo "✓ 已檢測到 YubiKey"
+        
+        # 步驟 3: 嘗試讀取密碼
+        VPN_PASSWORD=$(pass show vpn/fortigate 2>&1)
+        
+        if [ $? -ne 0 ]; then
+            echo "✗ 無法從 pass 取得密碼"
+            echo "   將使用手動輸入模式..."
+            USE_MANUAL=1
+        else
+            echo "✓ 已從 pass 取得密碼"
+            USE_PASS=1
+        fi
+    else
+        echo "⚠️  未檢測到 YubiKey"
+        USE_MANUAL=1
+    fi
+else
+    echo "⚠️  未安裝 pass 密碼管理器"
+    USE_MANUAL=1
+fi
+----
+
+==== 偵測時機的重要性
+
+[source]
+----
+錯誤做法：
+  if command -v pass; then
+      USE_PASS=1  ← 太早決定，未實際測試
+  fi
+  
+  # 後續執行時才發現 YubiKey 未插入
+  pass show vpn/fortigate | ...  ← 失敗！
+
+正確做法：
+  if command -v pass; then
+      if gpg --card-status &>/dev/null; then  ← 確認硬體
+          VPN_PASSWORD=$(pass show vpn/fortigate 2>&1)  ← 實際測試
+          if [ $? -eq 0 ]; then
+              USE_PASS=1  ← 確認可用才設定
+          fi
+      fi
+  fi
+----
+
+=== 自動模式實作
+
+==== sudo 預先驗證
+
+背景執行時的 sudo 問題：
+
+[source,bash]
+----
+# 問題：在背景執行時 sudo 要求密碼
+$ nohup bash -c "pass vpn/fortigate | sudo openfortivpn ..." &
+[sudo] password for jojo: _____  ← 背景程序無法輸入！
+----
+
+解決：預先驗證 sudo
+
+[source,bash]
+----
+# 在前景預先驗證
+echo "⚠️  需要 sudo 權限啟動 VPN"
+sudo -v
+if [ $? -ne 0 ]; then
+    echo "✗ sudo 驗證失敗"
+    exit 1
+fi
+
+# 現在可以在背景使用 sudo（15 分鐘內有效）
+nohup bash -c "pass vpn/fortigate | sudo openfortivpn ..." &
+----
+
+TIP: `sudo -v` 驗證成功後，sudo 快取預設保持 15 分鐘。
+
+==== nohup 背景執行
+
+[source,bash]
+----
+# 完整的自動模式命令
+nohup bash -c "pass vpn/fortigate | sudo openfortivpn -c '$SCRIPT_DIR/fortigate.conf'" \
+    > /tmp/vpn-connect.log 2>&1 &
+
+VPN_PID=$!
+echo "$VPN_PID" > /tmp/vpn.pid
+----
+
+參數說明：
+
+[cols="1,3"]
+|===
+| 參數 | 說明
+
+| `nohup`
+| 使程序在終端關閉後繼續執行
+
+| `bash -c "..."`
+| 在子 shell 中執行管道命令
+
+| `> /tmp/vpn-connect.log 2>&1`
+| 重導向輸出到日誌檔案
+
+| `&`
+| 在背景執行
+
+| `$!`
+| 取得最後一個背景程序的 PID
+
+| `echo "$VPN_PID" > /tmp/vpn.pid`
+| 儲存 PID 供 disconnect 腳本使用
+|===
+
+==== PID 追蹤機制
+
+[source]
+----
+為何需要 PID？
+
+問題：
+  • nohup 執行後，如何找到 VPN 程序？
+  • pkill openfortivpn 可能誤殺其他使用者的連接
+  
+解決：
+  • 儲存 PID 到檔案
+  • 使用特定 PID 終止程序
+  
+流程：
+  connect-vpn.sh → 啟動 VPN → 儲存 PID 到 /tmp/vpn.pid
+                                     ↓
+  disconnect-vpn.sh → 讀取 /tmp/vpn.pid → kill $PID
+----
+
+==== 等待 VPN 建立
+
+[source,bash]
+----
+echo "等待 VPN 介面建立..."
+VPN_CONNECTED=0
+
+for i in {1..60}; do
+    # 檢查 ppp0 介面是否存在
+    if ip addr show ppp0 &>/dev/null 2>&1; then
+        echo ""
+        echo "✓ VPN 介面 ppp0 已建立"
+        VPN_CONNECTED=1
+        break
+    fi
+    
+    # 檢查程序是否還在運行
+    if ! kill -0 $VPN_PID 2>/dev/null; then
+        echo ""
+        echo "✗ VPN 程序已退出"
+        tail -20 /tmp/vpn-connect.log  # 顯示錯誤訊息
+        exit 1
+    fi
+    
+    sleep 1
+    if [ $((i % 5)) -eq 0 ]; then
+        echo -n "."
+    fi
+done
+
+if [ "$VPN_CONNECTED" -eq 0 ]; then
+    echo ""
+    echo "✗ VPN 連接逾時"
+    exit 1
+fi
+----
+
+邏輯說明：
+
+1. 最多等待 60 秒
+2. 每秒檢查一次 ppp0 是否存在
+3. 同時檢查程序是否異常退出
+4. 每 5 秒顯示一個點（視覺回饋）
+
+=== 連接狀態顯示
+
+==== 取得 VPN IP
+
+[source,bash]
+----
+VPN_IP=$(ip addr show ppp0 | grep "inet " | awk '{print $2}')
+echo "VPN IP: $VPN_IP"
+----
+
+輸出範例：
+
+[source]
+----
+VPN IP: 10.212.134.100/32
+----
+
+==== 顯示 Server-pushed routes
+
+[source,bash]
+----
+echo ""
+echo "=== Server 推送的路由 ==="
+ip route show | grep "dev ppp0" | head -10
+----
+
+輸出範例：
+
+[source]
+----
+=== Server 推送的路由 ===
+140.128.0.0/16 dev ppp0 scope link
+163.17.38.0/24 dev ppp0 scope link
+163.17.117.0/24 dev ppp0 scope link
+210.69.115.0/24 dev ppp0 scope link
+...
+----
+
+==== 測試連接
+
+[source,bash]
+----
+echo ""
+echo "=== 測試連接 ==="
+if ping -c 2 -W 3 163.17.38.238 &>/dev/null; then
+    echo "✓ Cisco 設備 (163.17.38.238) 可達"
+else
+    echo "⚠ Cisco 設備 ping 失敗（可能禁止 ICMP）"
+fi
+----
+
+IMPORTANT: 某些企業設備禁止 ICMP，ping 失敗不代表連接有問題。
+
+== 輔助腳本
+
+=== disconnect-vpn.sh
+
+==== 腳本功能
+
+* 中斷 VPN 連接
+* 支援 YubiKey 自動模式和手動模式
+* 清理臨時檔案
+
+==== 實作
+
+[source,bash]
+----
+#!/bin/bash
+
+echo "=========================================="
+echo "中斷 VPN 連接"
+echo "=========================================="
+
+# 檢查是否使用 YubiKey 自動模式（有 PID 檔案）
+if [ -f /tmp/vpn.pid ]; then
+    VPN_PID=$(cat /tmp/vpn.pid)
+    echo "偵測到 YubiKey 自動模式（PID: $VPN_PID）"
+    
+    # 終止 VPN 程序
+    if kill -0 $VPN_PID 2>/dev/null; then
+        echo "正在終止 VPN 程序..."
+        sudo kill $VPN_PID
+        sleep 2
+        
+        # 強制終止（如果還在）
+        if kill -0 $VPN_PID 2>/dev/null; then
+            sudo kill -9 $VPN_PID
+        fi
+        
+        echo "✓ VPN 已中斷"
+    else
+        echo "⚠ VPN 程序已不存在"
+    fi
+    
+    # 清理 PID 檔案
+    rm -f /tmp/vpn.pid
+    
+# 檢查是否使用 screen 手動模式
+elif screen -list | grep -q "\.vpn"; then
+    echo "偵測到 screen 手動模式"
+    echo "正在終止 screen 會話..."
+    screen -S vpn -X quit
+    echo "✓ screen 會話已終止"
+else
+    echo "未偵測到活動的 VPN 連接"
+fi
+
+# 額外確保 openfortivpn 已終止
+if pgrep openfortivpn &>/dev/null; then
+    echo "清理殘留的 openfortivpn 程序..."
+    sudo pkill openfortivpn
+fi
+
+# 清理日誌（可選）
+rm -f /tmp/vpn-connect.log
+
+echo "=========================================="
+echo "✓ VPN 已完全中斷"
+echo "=========================================="
+----
+
+==== 雙模式支援邏輯
+
+[source]
+----
+中斷流程決策樹：
+
+是否存在 /tmp/vpn.pid？
+  ├─ 是：YubiKey 自動模式
+  │   ├─ 讀取 PID
+  │   ├─ kill $PID
+  │   └─ 刪除 /tmp/vpn.pid
+  │
+  └─ 否：檢查 screen 會話
+      ├─ 存在 screen vpn：手動模式
+      │   └─ screen -S vpn -X quit
+      │
+      └─ 都不存在：沒有活動連接
+----
+
+=== show-vpn-status.sh
+
+==== 腳本功能
+
+* 顯示 VPN 連接狀態
+* 顯示 VPN IP 和路由
+* 測試企業網路和本機網路連接
+* 顯示外部 IP（驗證 split tunneling）
+
+==== 實作重點
+
+[source,bash]
+----
+#!/bin/bash
+
+echo "=========================================="
+echo "VPN 連接狀態"
+echo "=========================================="
+
+# 檢查 ppp0 介面
+if ip addr show ppp0 &>/dev/null 2>&1; then
+    echo "✓ VPN 已連接"
+    
+    # 顯示 VPN IP
+    VPN_IP=$(ip addr show ppp0 | grep "inet " | awk '{print $2}')
+    echo "VPN IP: $VPN_IP"
+    
+    # 判斷連接模式
+    if [ -f /tmp/vpn.pid ]; then
+        VPN_PID=$(cat /tmp/vpn.pid)
+        echo "連接模式: YubiKey 自動模式（PID: $VPN_PID）"
+    elif screen -list | grep -q "\.vpn"; then
+        echo "連接模式: 手動模式（screen 會話）"
+    else
+        echo "連接模式: 未知"
+    fi
+    
+    # 顯示路由
+    echo ""
+    echo "=== VPN 路由 ==="
+    ip route show | grep "dev ppp0" | head -10
+    
+    # 測試連接
+    echo ""
+    echo "=== 連接測試 ==="
+    
+    # 測試企業網路
+    if ping -c 2 -W 3 163.17.38.238 &>/dev/null; then
+        echo "✓ Cisco (163.17.38.238) 可達"
+    else
+        echo "✗ Cisco ping 失敗"
+    fi
+    
+    # 測試本機網路
+    GATEWAY=$(ip route | grep default | awk '{print $3}' | head -1)
+    if ping -c 2 -W 3 $GATEWAY &>/dev/null; then
+        echo "✓ 本機閘道 ($GATEWAY) 可達"
+    fi
+    
+    # 顯示外部 IP
+    echo ""
+    echo "=== 外部 IP（驗證 Split Tunneling）==="
+    EXTERNAL_IP=$(curl -s --max-time 5 ifconfig.me)
+    echo "外部 IP: $EXTERNAL_IP"
+    echo "（應為本機 IP，不是 VPN IP）"
+    
+else
+    echo "✗ VPN 未連接"
+    echo ""
+    echo "使用以下命令連接："
+    echo "  bash ./connect-vpn.sh"
+fi
+
+echo "=========================================="
+----
+
+== Trap 清理機制
+
+=== 為何需要 Trap？
+
+==== 問題場景
+
+[source,bash]
+----
+# 腳本建立臨時檔案
+cat > /tmp/vpn-connect-wrapper.sh << 'EOF'
+...
+EOF
+
+# 正常執行
+...
+
+# 清理臨時檔案
+rm -f /tmp/vpn-connect-wrapper.sh  ← 只在正常退出時執行
+----
+
+問題：
+
+* 使用者按 Ctrl+C → 臨時檔案殘留
+* 腳本發生錯誤 → 臨時檔案殘留
+* 系統發送 SIGTERM → 臨時檔案殘留
+
+==== Trap 機制
+
+[source,bash]
+----
+# 定義清理函數
+cleanup() {
+    rm -f /tmp/vpn-connect-wrapper.sh
+}
+
+# 註冊清理函數，在以下情況執行：
+trap cleanup EXIT INT TERM
+             ↑    ↑   ↑
+             │    │   └─ SIGTERM（systemd 終止）
+             │    └───── Ctrl+C（SIGINT）
+             └────────── 正常退出或任何 exit
+----
+
+=== Trap 實作
+
+==== 在腳本開頭註冊
+
+[source,bash]
+----
+#!/bin/bash
+
+# 取得腳本所在目錄
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+
+# 清理函數
+cleanup() {
+    rm -f /tmp/vpn-connect-wrapper.sh
+}
+
+# 註冊清理函數
+trap cleanup EXIT INT TERM
+
+echo "=========================================="
+echo "Fortigate VPN 連接腳本"
+echo "=========================================="
+...
+----
+
+==== 效果驗證
+
+[source]
+----
+測試場景 1: 正常退出
+  $ bash ./connect-vpn.sh
+  ...
+  [正常完成]
+  → cleanup() 執行 ← trap EXIT
+  → 臨時檔案被刪除 ✓
+
+測試場景 2: Ctrl+C 中斷
+  $ bash ./connect-vpn.sh
+  ...
+  [按 Ctrl+C]
+  ^C
+  → cleanup() 執行 ← trap INT
+  → 臨時檔案被刪除 ✓
+
+測試場景 3: 腳本錯誤
+  $ bash ./connect-vpn.sh
+  ...
+  ./connect-vpn.sh: line 50: some_error
+  → cleanup() 執行 ← trap EXIT
+  → 臨時檔案被刪除 ✓
+----
+
+== 完整流程示範
+
+=== 自動模式完整流程
+
+[source,bash]
+----
+$ bash ./scripts/connect-vpn.sh
+==========================================
+Fortigate VPN 連接腳本
+==========================================
+
+=== 連接前的網路狀態 ===
+當前 IP: 192.168.89.130
+預設閘道: 192.168.89.1 (介面: ens33)
+LAN 網段: 192.168.89.0/24
+
+=== 檢測 YubiKey/GPG 密碼管理器 ===
+✓ 已檢測到 YubiKey
+⚠️  請準備輸入 PIN（如果需要）
+
+┌─────────────────────────────────┐
+│ Please enter the PIN            │  ← YubiKey PIN 輸入
+│                                  │
+│ PIN: ******                      │
+│                                  │
+│      [確定]      [取消]          │
+└─────────────────────────────────┘
+
+✓ 已從 pass 取得密碼
+
+=== 啟動 VPN 連接 ===
+使用 YubiKey 自動連接...
+⚠️  需要 sudo 權限啟動 VPN
+[sudo] password for jojo: ********  ← Linux sudo 密碼
+
+[DEBUG] 正在啟動 openfortivpn...
+[DEBUG] VPN 進程 PID: 12345
+等待 VPN 介面建立...
+.....
+✓ VPN 介面 ppp0 已建立
+VPN IP: 10.212.134.100/32
+
+=== Server 推送的路由 ===
+140.128.0.0/16 dev ppp0 scope link
+163.17.38.0/24 dev ppp0 scope link
+163.17.117.0/24 dev ppp0 scope link
+210.69.115.0/24 dev ppp0 scope link
+...
+
+==========================================
+✓ VPN 連接完成（由 Fortigate Server 管理路由）
+==========================================
+VPN 進程 PID: 12345
+日誌檔案: /tmp/vpn-connect.log
+
+現在可以 SSH 到 Cisco:
+  ssh admin@163.17.38.238
+
+中斷 VPN: /home/jojo/netbox-automation/scripts/disconnect-vpn.sh
+查看狀態: /home/jojo/netbox-automation/scripts/show-vpn-status.sh
+==========================================
+----
+
+=== SSH 到企業設備
+
+[source,bash]
+----
+$ ssh admin@163.17.38.238
+Password: ********
+
+Cisco-Switch>
+----
+
+✓ 成功透過 VPN 連接企業設備
+
+=== 中斷 VPN
+
+[source,bash]
+----
+$ bash ./scripts/disconnect-vpn.sh
+==========================================
+中斷 VPN 連接
+==========================================
+偵測到 YubiKey 自動模式（PID: 12345）
+正在終止 VPN 程序...
+✓ VPN 已中斷
+==========================================
+✓ VPN 已完全中斷
+==========================================
+----
+
+== 故障排除
+
+=== 問題 1: pass 無法讀取密碼
+
+==== 錯誤訊息
+
+[source,bash]
+----
+$ pass show vpn/fortigate
+gpg: decryption failed: No secret key
+----
+
+==== 原因與解決
+
+原因：
+
+* YubiKey 未插入
+* GPG 未偵測到 YubiKey
+* 金鑰 ID 不匹配
+
+解決：
+
+[source,bash]
+----
+# 1. 檢查 YubiKey
+$ gpg --card-status
+# 如果失敗 → 重新啟動服務
+$ gpg-connect-agent reloadagent /bye
+$ sudo systemctl restart pcscd
+
+# 2. 檢查金鑰是否在卡片上
+$ gpg --list-secret-keys
+sec>  rsa4096/30B413E724701EA1 ...
+      ↑
+   必須有 ">" 符號
+----
+
+=== 問題 2: sudo 在背景要求密碼
+
+==== 錯誤訊息
+
+[source,bash]
+----
+[DEBUG] 正在啟動 openfortivpn...
+[DEBUG] VPN 進程 PID: 12345
+等待 VPN 介面建立...
+.................（一直等待）
+✗ VPN 連接逾時
+----
+
+查看日誌：
+
+[source,bash]
+----
+$ tail /tmp/vpn-connect.log
+[sudo] password for jojo: _____  ← 卡在這裡
+----
+
+==== 原因與解決
+
+原因：背景執行時 sudo 要求密碼，但無法輸入
+
+解決：腳本中已實作 `sudo -v` 預先驗證
+
+[source,bash]
+----
+# 確認 sudo -v 部分存在
+if [ "$USE_PASS" = "1" ]; then
+    echo "⚠️  需要 sudo 權限啟動 VPN"
+    sudo -v  ← 必須在前景執行
+    ...
+fi
+----
+
+=== 問題 3: VPN 連接成功但無法存取企業網路
+
+==== 症狀
+
+[source,bash]
+----
+$ ping 163.17.38.238
+PING 163.17.38.238 (163.17.38.238) 56(84) bytes of data.
+--- 163.17.38.238 ping statistics ---
+5 packets transmitted, 0 received, 100% packet loss
+----
+
+==== 原因與解決
+
+原因 1：路由未正確推送
+
+[source,bash]
+----
+# 檢查路由表
+$ ip route show | grep ppp0
+# 如果沒有輸出 → fortigate.conf 設定錯誤
+
+# 檢查設定檔
+$ grep set-routes ~/netbox-automation/scripts/fortigate.conf
+set-routes = 1  ← 必須為 1
+----
+
+原因 2：企業設備禁止 ICMP
+
+[source,bash]
+----
+# 嘗試 TCP 連接而非 ping
+$ nc -zv 163.17.38.238 22
+Connection to 163.17.38.238 22 port [tcp/ssh] succeeded!
+----
+
+✓ TCP 連接成功 → 網路正常，只是禁止 ICMP
+
+=== 問題 4: GPG agent timeout
+
+==== 錯誤訊息
+
+[source,bash]
+----
+$ pass show vpn/fortigate
+gpg: agent_get_passphrase failed: Timeout
+----
+
+==== 原因與解決
+
+原因：gpg-agent 的 pinentry-timeout 太短
+
+解決：
+
+[source,bash]
+----
+# 修改 gpg-agent 設定
+$ echo "pinentry-timeout 120" >> ~/.gnupg/gpg-agent.conf
+
+# 重新啟動 gpg-agent
+$ gpg-connect-agent reloadagent /bye
+----
+
+== 小結
+
+=== 關鍵要點
+
+1. **openfortivpn 支援 stdin**：可從管道接收密碼
+2. **Server-pushed routes**：`set-routes = 1` 接受伺服器管理路由
+3. **Split tunneling**：保留本機網路，僅企業流量走 VPN
+4. **pass 整合**：`pass show vpn/fortigate | sudo openfortivpn`
+5. **sudo 預先驗證**：`sudo -v` 避免背景執行時要求密碼
+6. **PID 追蹤**：儲存到 /tmp/vpn.pid 供 disconnect 使用
+7. **Trap 清理機制**：確保臨時檔案在任何情況下都被清理
+
+=== 驗證清單
+
+自動化 VPN 系統完成檢查：
+
+- [ ] `pass show vpn/fortigate` 可成功解密（輸入 YubiKey PIN）
+- [ ] `bash ./connect-vpn.sh` 自動偵測 YubiKey
+- [ ] VPN 連接後可 ping 企業網路（163.17.38.238）
+- [ ] Split tunneling 有效（外部 IP 是本機 IP）
+- [ ] `bash ./disconnect-vpn.sh` 可正確中斷連接
+- [ ] 移除 YubiKey 後自動切換到手動模式
+
+=== 下一章預告
+
+link:04-manual-mode.adoc[下一章] 將探討：
+
+* 為何無 YubiKey 時需要 screen
+* screen 的背景執行機制
+* 互動式密碼輸入的設計
+* 如何在 screen 會話間切換
+
+---
+
+link:02-yubikey-integration.adoc[← 上一章：YubiKey 整合] | link:00-overview.adoc[返回總覽] | link:04-manual-mode.adoc[下一章：手動輸入模式 →]

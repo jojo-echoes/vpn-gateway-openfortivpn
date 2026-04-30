@@ -1,0 +1,827 @@
+= OpenPGP 加密機制與實作
+:toc: left
+:toclevels: 4
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+
+link:00-overview.adoc[← 返回總覽] | link:02-yubikey-integration.adoc[下一章：YubiKey 整合 →]
+
+== 章節簡介
+
+本章深入探討 OpenPGP 加密機制在密碼管理中的應用，包括：
+
+* GPG 金鑰對的產生與管理
+* 密碼加密的完整流程
+* 加密檔案的驗證方法
+* 實際執行的程式與步驟
+
+== OpenPGP 簡介
+
+=== 什麼是 OpenPGP？
+
+OpenPGP（Open Pretty Good Privacy）是一個用於加密和簽署資料的標準協定，基於 PGP（Pretty Good Privacy）開發。
+
+主要特性：
+
+* **非對稱加密**：使用公鑰/私鑰對
+* **混合加密**：結合對稱與非對稱加密的優點
+* **數位簽章**：確保資料完整性與來源
+* **金鑰管理**：信任網路（Web of Trust）機制
+
+=== 在本專案中的角色
+
+[source]
+----
+使用者密碼（明文）
+    ↓
+┌───────────────────────────┐
+│  OpenPGP 加密             │
+│  • 使用公鑰加密           │
+│  • 產生加密檔案           │
+└───────────────────────────┘
+    ↓
+~/.password-store/vpn/fortigate.gpg
+    （加密檔案，605 bytes）
+    ↓
+┌───────────────────────────┐
+│  OpenPGP 解密             │
+│  • 使用私鑰（YubiKey）    │
+│  • 需要 PIN 驗證          │
+└───────────────────────────┘
+    ↓
+明文密碼 → 傳送給 openfortivpn
+----
+
+== 金鑰對產生
+
+=== 產生 RSA 4096 金鑰
+
+==== 執行命令
+
+[source,bash]
+----
+$ gpg --full-generate-key --expert
+----
+
+==== 互動式選項
+
+[source]
+----
+請選擇你要使用的金鑰種類：
+   (9) RSA (設定你自己的能力)
+
+你的選擇是？9
+
+目前允許的動作：簽署 認證
+   (S) 切換簽署能力
+   (E) 切換加密能力
+   (A) 切換認證能力
+   (Q) 完成
+
+你的選擇？E  ← 啟用加密能力
+
+目前允許的動作：簽署 加密 認證
+
+你的選擇？Q  ← 確認
+
+RSA 金鑰的長度可能介於 1024 位元和 4096 位元之間。
+你想要用多大的金鑰尺寸？(3072) 4096  ← 選擇 4096
+
+金鑰的有效期限是？(0) 0  ← 永不過期
+金鑰完全不會過期
+
+這樣對嗎？(y/N) y
+
+真實姓名：YubiKey User  ← 輸入識別資訊
+電子郵件地址：user@example.com
+註釋：For VPN Password Management
+----
+
+==== 金鑰產生過程
+
+[source,bash]
+----
+# 系統會收集隨機熵以產生金鑰
+我們需要產生大量的隨機位元組。這個時候你可以多做一些事情
+（像是敲打鍵盤、移動滑鼠、讀寫硬碟之類的）
+這會讓隨機數字產生器有更多的機會獲得夠多的熵。
+
+# 產生結果
+gpg: 金鑰 30B413E724701EA1 已標記成徹底信任
+gpg: 建立註銷憑證 '/home/jojo/.gnupg/openpgp-revocs.d/XXX.rev'
+公鑰和私鑰已產生並經簽署。
+
+pub   rsa4096 2026-01-31 [SCE]
+      ABC123DEF456GHI789JKL012MNO345PQR678ST
+uid                      YubiKey User (For VPN Password Management) <user@example.com>
+----
+
+=== 金鑰產生過程中的技術細節
+
+==== 1. 熵（Entropy）收集
+
+現代 Linux 核心（6.8+）使用 ChaCha20 DRNG（Deterministic Random Number Generator）：
+
+[source,bash]
+----
+# 查看熵池狀態（僅供參考，現代核心固定 256）
+$ cat /proc/sys/kernel/random/entropy_avail
+256
+----
+
+TIP: Ubuntu 24.04 的核心已修正傳統 256-bit entropy pool 問題，實際可用熵遠大於顯示值。
+
+==== 2. 金鑰結構
+
+產生的金鑰包含三個子金鑰：
+
+[source,bash]
+----
+$ gpg --list-keys --keyid-format LONG 30B413E724701EA1
+
+pub   rsa4096/30B413E724701EA1 2026-01-31 [SC]
+      主金鑰：用於簽署（S）和認證（C）
+      
+sub   rsa4096/987C1049CF851A3F 2026-01-31 [E]
+      子金鑰：用於加密（E）
+----
+
+[cols="1,1,3"]
+|===
+| 金鑰 | 能力 | 用途
+
+| 主金鑰 (pub)
+| SC
+| **S**ign（簽署）+ **C**ertify（認證）
+
+| 子金鑰 (sub)
+| E
+| **E**ncrypt（加密）
+|===
+
+==== 3. 金鑰儲存位置
+
+[source,bash]
+----
+~/.gnupg/
+├── private-keys-v1.d/       # 私鑰（二進位格式）
+│   ├── KEYGRIP1.key         # 主金鑰的 keygrip
+│   └── KEYGRIP2.key         # 子金鑰的 keygrip
+├── pubring.kbx              # 公鑰環（keybox 格式）
+├── trustdb.gpg              # 信任資料庫
+└── openpgp-revocs.d/        # 註銷憑證
+    └── FINGERPRINT.rev
+----
+
+== 密碼加密流程
+
+=== 使用 pass 初始化
+
+==== pass 是什麼？
+
+`pass` (password-store) 是一個基於 GPG 的 Unix 密碼管理器，特色：
+
+* 每個密碼儲存為獨立的 GPG 加密檔案
+* 使用 Git 進行版本控制（可選）
+* 簡單的指令列介面
+* 與 GPG 金鑰完美整合
+
+==== 初始化 pass
+
+[source,bash]
+----
+# 使用 GPG 金鑰 ID 初始化
+$ pass init 30B413E724701EA1
+
+mkdir: 已建立目錄 '/home/jojo/.password-store/'
+Password store initialized for 30B413E724701EA1
+----
+
+此命令建立：
+
+[source,bash]
+----
+~/.password-store/
+└── .gpg-id    # 內容：30B413E724701EA1
+----
+
+=== 儲存密碼
+
+==== 儲存 VPN 密碼
+
+[source,bash]
+----
+$ pass insert vpn/fortigate
+Enter password for vpn/fortigate: ********
+Retype password for vpn/fortigate: ********
+----
+
+==== 背後發生的事情
+
+實際執行的命令（pass 內部）：
+
+[source,bash]
+----
+# 1. 接收密碼（標準輸入）
+echo "your_password" | \
+
+# 2. 使用 GPG 加密
+gpg --encrypt \
+    --recipient 30B413E724701EA1 \
+    --armor \
+    --output ~/.password-store/vpn/fortigate.gpg
+----
+
+[cols="1,3"]
+|===
+| 參數 | 說明
+
+| `--encrypt`
+| 加密模式
+
+| `--recipient 30B413E724701EA1`
+| 使用此金鑰的公鑰加密（實際使用子金鑰 987C1049CF851A3F）
+
+| `--armor`
+| 產生 ASCII 格式（可選，pass 使用二進位）
+
+| `--output`
+| 指定輸出檔案
+|===
+
+=== 加密過程詳解
+
+==== 混合加密機制
+
+OpenPGP 使用混合加密系統：
+
+[source]
+----
+步驟 1: 產生隨機對稱金鑰
+   ┌────────────────────┐
+   │  Session Key       │  ← AES-256 隨機金鑰
+   │  (32 bytes)        │
+   └────────────────────┘
+
+步驟 2: 使用 Session Key 加密密碼
+   明文密碼
+      ↓
+   [ AES-256-CFB 加密 ]
+      ↓
+   密文資料（Encrypted Data Packet）
+
+步驟 3: 使用 RSA 公鑰加密 Session Key
+   Session Key
+      ↓
+   [ RSA-4096 公鑰加密 ]
+      ↓
+   加密的 Session Key（Public Key Encrypted Session Key Packet）
+
+最終檔案結構:
+   ┌──────────────────────────────┐
+   │ Public Key Encrypted Session │  ← 525 bytes
+   │ Key Packet (RSA-4096)        │
+   ├──────────────────────────────┤
+   │ Encrypted Data Packet        │  ← 124 bytes
+   │ (AES-256, AEAD mode)         │
+   │   - MDC (Modification        │
+   │     Detection Code)          │
+   │   - Compressed payload       │
+   │   - Literal data (17 bytes)  │
+   └──────────────────────────────┘
+   總計: 649 bytes (with headers)
+----
+
+==== 為何使用混合加密？
+
+[cols="1,1,3"]
+|===
+| 加密方式 | 速度 | 適用場景
+
+| 對稱加密（AES）
+| 快
+| 大量資料加密
+
+| 非對稱加密（RSA）
+| 慢
+| 金鑰交換、小量資料
+
+| 混合方式
+| 最佳
+| 用 RSA 保護 AES 金鑰，用 AES 加密資料
+|===
+
+=== 檔案結構分析
+
+==== 查看檔案大小
+
+[source,bash]
+----
+$ ls -lh ~/.password-store/vpn/fortigate.gpg
+-rw------- 1 jojo jojo 605 Jan 31 16:30 fortigate.gpg
+----
+
+==== 使用 gpg --list-packets 分析
+
+[source,bash]
+----
+$ gpg --list-packets ~/.password-store/vpn/fortigate.gpg
+
+# off=0 ctb=c1 tag=1 hlen=3 plen=525 new-ctb
+:pubkey enc packet: version 3, algo 1, keyid 987C1049CF851A3F
+	data: [4095 bits]
+# off=528 ctb=d2 tag=18 hlen=2 plen=124 new-ctb
+:encrypted data packet:
+	length: 124
+	mdc_method: 2
+gpg: encrypted with rsa4096 key, ID 987C1049CF851A3F, created 2026-01-31
+      "YubiKey User (For VPN Password Management) <user@example.com>"
+# off=532 ctb=d2 tag=18 hlen=2 plen=120 new-ctb
+:encrypted data packet:
+	length: 120
+	mdc_method: 2
+# off=654 ctb=a3 tag=8 hlen=1 plen=0 indeterminate
+:compressed packet: algo=2
+# off=656 ctb=ac tag=11 hlen=2 plen=19 new-ctb
+:literal data packet:
+	mode b (62), created 0, name="",
+	raw data: 17 bytes
+----
+
+==== 封包結構解析
+
+[cols="1,1,2,2"]
+|===
+| Offset | Tag | 封包類型 | 內容
+
+| 0
+| 1
+| Public Key Encrypted Session Key
+| RSA-4096 加密的 Session Key（525 bytes）
+
+| 528
+| 18
+| Encrypted Data Packet
+| AES 加密的資料（124 bytes） +
+MDC method 2（SHA-256）
+
+| 654
+| 8
+| Compressed Packet
+| 壓縮演算法 2（ZIP）
+
+| 656
+| 11
+| Literal Data Packet
+| 實際密碼資料（17 bytes） +
+包含密碼 + 換行符
+|===
+
+IMPORTANT: `raw data: 17 bytes` 表示密碼長度為 16 個字元 + 1 個換行符。
+
+== 密碼解密流程
+
+=== 手動解密測試
+
+==== 基本解密命令
+
+[source,bash]
+----
+$ gpg --decrypt ~/.password-store/vpn/fortigate.gpg
+gpg: encrypted with rsa4096 key, ID 987C1049CF851A3F, created 2026-01-31
+      "YubiKey User (For VPN Password Management) <user@example.com>"
+your_actual_password
+----
+
+==== 解密過程
+
+[source]
+----
+步驟 1: GPG 讀取加密檔案
+   └─ 識別需要的私鑰：987C1049CF851A3F（加密子金鑰）
+
+步驟 2: 尋找私鑰
+   └─ 檢查 ~/.gnupg/private-keys-v1.d/
+   └─ 或 檢查智能卡（gpg --card-status）
+
+步驟 3: 解鎖私鑰
+   └─ 如果在本機：要求輸入 passphrase
+   └─ 如果在 YubiKey：要求輸入 PIN
+
+步驟 4: 解密 Session Key
+   └─ 使用 RSA 私鑰解密 Public Key Encrypted Session Key Packet
+   └─ 得到 AES-256 Session Key
+
+步驟 5: 解密資料
+   └─ 使用 Session Key 解密 Encrypted Data Packet
+   └─ 驗證 MDC（確保資料未被竄改）
+   └─ 解壓縮 ZIP
+   └─ 提取 Literal Data
+
+步驟 6: 輸出明文
+   └─ your_actual_password
+----
+
+=== 與 GPG Agent 的互動
+
+==== GPG Agent 角色
+
+`gpg-agent` 是 GPG 的守護程序，負責：
+
+* 快取解密後的私鑰
+* 管理 PIN/passphrase 輸入
+* 與智能卡（YubiKey）通訊
+
+==== 設定檔
+
+[source,bash]
+----
+$ cat ~/.gnupg/gpg-agent.conf
+default-cache-ttl 600          # 預設快取 10 分鐘
+max-cache-ttl 7200             # 最大快取 2 小時
+pinentry-timeout 120           # PIN 輸入逾時 2 分鐘
+----
+
+==== 快取機制
+
+[source]
+----
+第一次解密:
+  ┌─────────┐
+  │ gpg     │ → 要求解密
+  └────┬────┘
+       ↓
+  ┌─────────┐
+  │ gpg-    │ → 要求 PIN
+  │ agent   │
+  └────┬────┘
+       ↓
+  ┌─────────┐
+  │ pinentry│ → 顯示 PIN 輸入框
+  └────┬────┘
+       ↓
+  輸入 PIN: ******
+       ↓
+  ┌─────────┐
+  │ YubiKey │ → 驗證 PIN，執行解密
+  └────┬────┘
+       ↓
+  解密成功
+  gpg-agent 快取私鑰（600 秒）
+
+10 分鐘內的第二次解密:
+  ┌─────────┐
+  │ gpg     │ → 要求解密
+  └────┬────┘
+       ↓
+  ┌─────────┐
+  │ gpg-    │ → 使用快取的私鑰
+  │ agent   │    （不需要 PIN）
+  └────┬────┘
+       ↓
+  解密成功（無需 YubiKey 互動）
+----
+
+== 加密驗證方法
+
+=== 驗證加密是否有效
+
+==== 方法 1: 檢查檔案魔術數字
+
+[source,bash]
+----
+$ file ~/.password-store/vpn/fortigate.gpg
+/home/jojo/.password-store/vpn/fortigate.gpg: GPG encrypted data
+----
+
+==== 方法 2: 使用 hexdump 查看開頭
+
+[source,bash]
+----
+$ hexdump -C ~/.password-store/vpn/fortigate.gpg | head -5
+00000000  c1 03 01 98 7c 10 49 cf  85 1a 3f 10 00 bd 29 12  |....|.I...?...).|
+                 ↑
+                 Tag 1 (Public Key Encrypted Session Key)
+----
+
+OpenPGP 封包開頭標記：
+
+[cols="1,1,3"]
+|===
+| Byte | 值 | 意義
+
+| 0x01
+| `c1`
+| Packet Tag 1（New format CTB）
+
+| 0x01-02
+| `03 01`
+| Version 3, Algorithm 1 (RSA)
+
+| 0x03-10
+| `98 7c 10 49...`
+| Key ID (987C1049CF851A3F)
+|===
+
+==== 方法 3: 嘗試解密（最準確）
+
+[source,bash]
+----
+$ pass show vpn/fortigate
+[sudo] password for jojo: ******  ← 如果需要 sudo
+your_actual_password
+----
+
+成功輸出密碼 → 加密有效 ✓
+
+==== 方法 4: 使用 gpg --decrypt 並檢查退出碼
+
+[source,bash]
+----
+$ gpg --decrypt ~/.password-store/vpn/fortigate.gpg > /dev/null 2>&1
+$ echo $?
+0  ← 退出碼 0 表示成功
+----
+
+[cols="1,3"]
+|===
+| 退出碼 | 意義
+
+| 0
+| 解密成功
+
+| 2
+| 錯誤（例如：找不到私鑰、PIN 錯誤）
+
+| 1
+| 一般錯誤
+|===
+
+=== 驗證加密強度
+
+==== 檢查使用的金鑰長度
+
+[source,bash]
+----
+$ gpg --list-packets ~/.password-store/vpn/fortigate.gpg 2>&1 | grep "rsa"
+gpg: encrypted with rsa4096 key, ID 987C1049CF851A3F
+----
+
+✓ RSA 4096 位元 → 高強度加密
+
+==== 檢查加密演算法
+
+[source,bash]
+----
+$ gpg --list-packets --verbose ~/.password-store/vpn/fortigate.gpg 2>&1 | grep -E "algo|cipher"
+:pubkey enc packet: version 3, algo 1, keyid 987C1049CF851A3F
+	data: [4095 bits]
+:encrypted data packet:
+	mdc_method: 2
+----
+
+[cols="1,1,3"]
+|===
+| 欄位 | 值 | 說明
+
+| algo
+| 1
+| RSA (Encrypt or Sign)
+
+| mdc_method
+| 2
+| SHA-256 Modification Detection Code
+
+| cipher
+| (隱含)
+| AES-256-CFB（GPG 預設）
+|===
+
+==== 驗證 AEAD 模式
+
+GPG 2.4+ 使用 AEAD (Authenticated Encryption with Associated Data)：
+
+[source,bash]
+----
+$ gpg --version | grep -i aead
+Home: /home/jojo/.gnupg
+Supported algorithms:
+Cipher: AES, AES192, AES256, 3DES, CAMELLIA128, CAMELLIA192, CAMELLIA256
+AEAD: EAX, OCB
+----
+
+AEAD 提供：
+
+* **機密性**（Confidentiality）：資料加密
+* **完整性**（Integrity）：偵測竄改
+* **認證性**（Authenticity）：確認來源
+
+=== 常見錯誤排除
+
+==== 錯誤 1: "找不到解密金鑰"
+
+[source,bash]
+----
+$ pass show vpn/fortigate
+gpg: encrypted with 4096-bit RSA key, ID 987C1049CF851A3F
+gpg: decryption failed: No secret key
+----
+
+**原因**：私鑰不在本機或 YubiKey 未插入
+
+**解決**：
+
+[source,bash]
+----
+# 檢查私鑰
+$ gpg --list-secret-keys
+# 檢查 YubiKey
+$ gpg --card-status
+----
+
+==== 錯誤 2: "PIN 輸入逾時"
+
+[source,bash]
+----
+gpg: public key decryption failed: Timeout
+----
+
+**原因**：`pinentry-timeout` 太短
+
+**解決**：
+
+[source,bash]
+----
+$ echo "pinentry-timeout 120" >> ~/.gnupg/gpg-agent.conf
+$ gpg-connect-agent reloadagent /bye
+----
+
+==== 錯誤 3: "PIN 錯誤"
+
+[source,bash]
+----
+gpg: public key decryption failed: Bad PIN
+----
+
+**原因**：輸入的 PIN 不正確
+
+**解決**：
+
+[source,bash]
+----
+# 檢查剩餘嘗試次數
+$ gpg --card-status | grep "PIN retry"
+PIN retry counter : 3 0 3
+                    ↑
+                    還剩 3 次
+----
+
+WARNING: PIN 錯誤 3 次後，YubiKey OpenPGP 應用程式會鎖定！
+
+== 實際執行的程式與步驟
+
+=== 完整的密碼儲存流程
+
+[source,bash]
+----
+# 步驟 1: 產生 GPG 金鑰對
+$ gpg --full-generate-key --expert
+  實際執行：
+  - /usr/bin/gpg2
+  - /usr/libexec/gpg-agent (自動啟動)
+  - /dev/random (熵來源)
+
+# 步驟 2: 初始化 pass
+$ pass init 30B413E724701EA1
+  實際執行：
+  - /usr/bin/pass (Bash 腳本)
+  - mkdir ~/.password-store
+  - echo "30B413E724701EA1" > ~/.password-store/.gpg-id
+
+# 步驟 3: 儲存密碼
+$ pass insert vpn/fortigate
+  實際執行：
+  - /usr/bin/pass (接收密碼輸入)
+  - /usr/bin/gpg --encrypt --recipient 30B413E724701EA1
+  - 產生 ~/.password-store/vpn/fortigate.gpg
+----
+
+=== 完整的密碼讀取流程（YubiKey 模式）
+
+[source,bash]
+----
+# 命令
+$ pass show vpn/fortigate
+
+# 實際執行的程式鏈
+1. /usr/bin/pass (Bash 腳本)
+   └─> 呼叫 gpg --decrypt ~/.password-store/vpn/fortigate.gpg
+
+2. /usr/bin/gpg2
+   └─> 連接 gpg-agent (透過 socket)
+
+3. /usr/bin/gpg-agent
+   ├─> 檢查快取（是否已有解密金鑰）
+   └─> 如果沒快取:
+       ├─> 呼叫 scdaemon (智能卡守護程序)
+       └─> 呼叫 pinentry (PIN 輸入程式)
+
+4. /usr/lib/gnupg/scdaemon
+   └─> 與 pcscd 通訊 (PC/SC daemon)
+
+5. /usr/sbin/pcscd
+   └─> 透過 USB 與 YubiKey 通訊
+       (使用 libusb)
+
+6. YubiKey 5C NFC (硬體)
+   ├─> 驗證 PIN
+   └─> 執行 RSA-4096 解密運算
+       (在安全元件內，私鑰不離開)
+
+7. 解密結果回傳路徑
+   YubiKey → pcscd → scdaemon → gpg-agent → gpg → pass → stdout
+----
+
+=== 使用 strace 追蹤系統呼叫
+
+==== 追蹤 pass 命令
+
+[source,bash]
+----
+$ strace -f -e trace=execve pass show vpn/fortigate 2>&1 | grep execve
+
+execve("/usr/bin/pass", ["pass", "show", "vpn/fortigate"], ...)
+execve("/usr/bin/gpg", ["gpg", "--decrypt", "/home/jojo/.password-store/vpn/fortigate.gpg"], ...)
+execve("/usr/bin/gpg-agent", ["gpg-agent", "--daemon"], ...)
+execve("/usr/lib/gnupg/scdaemon", ["scdaemon", "--multi-server"], ...)
+execve("/usr/bin/pinentry", ["pinentry"], ...)
+----
+
+==== 追蹤檔案存取
+
+[source,bash]
+----
+$ strace -e trace=open,openat,read gpg --decrypt ~/.password-store/vpn/fortigate.gpg 2>&1 | grep -E "\.gpg|\.key"
+
+openat(AT_FDCWD, "/home/jojo/.password-store/vpn/fortigate.gpg", O_RDONLY) = 3
+openat(AT_FDCWD, "/home/jojo/.gnupg/pubring.kbx", O_RDONLY) = 4
+openat(AT_FDCWD, "/home/jojo/.gnupg/private-keys-v1.d/KEYGRIP.key", O_RDONLY) = -1 ENOENT
+# ↑ 本機沒有私鑰，轉向智能卡
+----
+
+=== 使用 lsof 查看開啟的檔案
+
+==== GPG 開啟的檔案
+
+[source,bash]
+----
+$ lsof -c gpg-agent
+
+COMMAND     PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+gpg-agent 12345 jojo  cwd    DIR   0,50      512    2 /home/jojo
+gpg-agent 12345 jojo    3u  unix            12345      /home/jojo/.gnupg/S.gpg-agent
+gpg-agent 12345 jojo    4u  unix            12346      /home/jojo/.gnupg/S.gpg-agent.extra
+----
+
+==== YubiKey 裝置
+
+[source,bash]
+----
+$ lsof | grep yubikey
+
+pcscd     1234 jojo    5u   CHR  189,0      0t0  /dev/bus/usb/001/002
+----
+
+== 小結
+
+=== 關鍵要點
+
+1. **OpenPGP 使用混合加密**：RSA-4096 保護 AES-256 Session Key
+2. **pass 是薄包裝**：底層完全使用 GPG 機制
+3. **gpg-agent 管理快取**：減少 PIN 輸入次數
+4. **檔案結構可驗證**：使用 `--list-packets` 分析加密封包
+5. **多層程序協作**：gpg → gpg-agent → scdaemon → pcscd → YubiKey
+
+=== 驗證清單
+
+檢查加密是否正確設置：
+
+- [ ] `file` 命令識別為 GPG 加密資料
+- [ ] `gpg --list-packets` 顯示 RSA-4096 金鑰
+- [ ] MDC method 2 (SHA-256) 存在
+- [ ] `pass show` 可成功解密
+- [ ] 退出碼為 0（`echo $?`）
+
+=== 下一章預告
+
+link:02-yubikey-integration.adoc[下一章] 將探討：
+
+* 如何將私鑰轉移到 YubiKey
+* YubiKey OpenPGP 應用程式的內部結構
+* 為何需要「Admin PIN」深入管理
+* 雙 YubiKey 備份策略
+
+---
+
+link:00-overview.adoc[← 返回總覽] | link:02-yubikey-integration.adoc[下一章：YubiKey 整合 →]

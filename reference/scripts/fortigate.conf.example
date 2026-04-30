@@ -1,0 +1,16 @@
+host = your_host_here
+port = your_port_here
+username = your_username_here
+# password = your_password_here  (建議刪除此行，讓 openfortivpn 每次詢問密碼)
+
+# 信任 Fortigate 憑證（從錯誤訊息複製）
+trusted-cert =  your_trusted-cert_here
+
+# 關鍵設定：接收 Server 推送的路由，但不改變預設閘道
+set-routes = 1
+half-internet-routes = 0
+set-dns = 0
+pppd-use-peerdns = 0
+
+# 日誌設定
+pppd-log = /tmp/pppd.log

@@ -1,0 +1,1368 @@
+= 完整工作流程與故障排除
+:toc: left
+:toclevels: 4
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+
+link:04-manual-mode.adoc[← 上一章：手動輸入模式] | link:00-overview.adoc[返回總覽]
+
+== 章節簡介
+
+本章整合前面所有章節的知識，提供完整的日常使用工作流程，包括：
+
+* 標準操作程序（SOP）
+* 常見問題的完整故障排除
+* 安全最佳實踐
+* 系統維護建議
+* 效能調校技巧
+
+== 快速開始指南
+
+=== 首次設置清單
+
+==== 1. 環境準備
+
+[source,bash]
+----
+# 安裝必要套件
+sudo apt update
+sudo apt install -y \
+    gpg \
+    pass \
+    pcscd \
+    scdaemon \
+    openfortivpn \
+    screen
+
+# 啟動智能卡服務
+sudo systemctl start pcscd
+sudo systemctl enable pcscd
+----
+
+==== 2. 設置 YubiKey 權限（VMware 環境）
+
+[source,bash]
+----
+# 建立 udev 規則
+sudo tee /etc/udev/rules.d/70-yubikey.rules << 'EOF'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0407", MODE="0666", GROUP="plugdev"
+EOF
+
+# 重新載入規則
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# 加入 plugdev 群組
+sudo usermod -aG plugdev $USER
+
+# 登出再登入使群組生效
+echo "請執行: exit 後重新登入"
+----
+
+==== 3. GPG 金鑰與 YubiKey 設置
+
+[source,bash]
+----
+# 產生 GPG 金鑰
+gpg --full-generate-key --expert
+# 選擇: (9) RSA, 能力 [SCE], 4096 bits
+
+# 初始化 pass
+pass init <金鑰 ID>
+
+# 儲存 VPN 密碼
+pass insert vpn/fortigate
+
+# 修改 YubiKey 金鑰屬性
+gpg --card-edit
+gpg/card> admin
+gpg/card> key-attr
+# 將三個插槽都改為 RSA 4096
+
+# 轉移金鑰到 YubiKey
+gpg --edit-key <金鑰 ID>
+gpg> keytocard  # 主金鑰 → 插槽 1
+gpg> key 1
+gpg> keytocard  # 子金鑰 → 插槽 2
+gpg> save
+----
+
+==== 4. 備份金鑰
+
+[source,bash]
+----
+# 匯出公鑰
+gpg --export --armor <金鑰 ID> > ~/yubikey-public-key.asc
+
+# 匯出私鑰（用於第二個 YubiKey）
+gpg --export-secret-keys --armor <金鑰 ID> > ~/yubikey-private-key-backup.asc
+
+# 產生註銷憑證
+gpg --gen-revoke --armor --output ~/yubikey-revoke-cert.rev <金鑰 ID>
+
+# 上傳到 Bitwarden（公鑰 + 註銷憑證）
+# 私鑰在轉移到第二個 YubiKey 後，使用 shred 銷毀
+----
+
+==== 5. 設置 FortiGate VPN
+
+[source,bash]
+----
+cd ~/netbox-automation/scripts
+
+# 建立設定檔（從範例複製）
+cp fortigate.conf.example fortigate.conf
+
+# 編輯設定檔
+vi fortigate.conf
+# 修改：
+#   host = <VPN 伺服器 IP>
+#   port = <VPN 埠號>
+#   username = <您的帳號>
+#   set-routes = 1
+#   trusted-cert = <伺服器憑證指紋>
+----
+
+==== 6. 驗證設置
+
+[source,bash]
+----
+# 測試 YubiKey 偵測
+gpg --card-status
+
+# 測試密碼解密
+pass show vpn/fortigate
+
+# 測試 VPN 連接
+bash ./connect-vpn.sh
+----
+
+✓ 首次設置完成
+
+=== 日常使用流程
+
+==== 標準工作流（YubiKey 模式）
+
+[source]
+----
+第 1 步：連接 VPN
+  $ cd ~/netbox-automation/scripts
+  $ bash ./connect-vpn.sh
+  
+  [輸入 YubiKey PIN]  ← 10 分鐘內只需輸入一次
+  [輸入 sudo 密碼]
+  
+  等待連接...
+  ✓ VPN 連接完成
+
+第 2 步：使用 VPN
+  $ ssh admin@163.17.38.238
+  # 存取企業資源...
+
+第 3 步：查看 VPN 狀態（可選）
+  $ bash ./show-vpn-status.sh
+  
+  VPN IP: 10.212.134.100/32
+  連接模式: YubiKey 自動模式
+
+第 4 步：中斷 VPN
+  $ bash ./disconnect-vpn.sh
+  
+  ✓ VPN 已中斷
+----
+
+==== 快速操作命令
+
+[source,bash]
+----
+# 連接 VPN
+$ bash ~/netbox-automation/scripts/connect-vpn.sh
+
+# 查看狀態
+$ bash ~/netbox-automation/scripts/show-vpn-status.sh
+
+# 中斷 VPN
+$ bash ~/netbox-automation/scripts/disconnect-vpn.sh
+
+# 查看 VPN 日誌（YubiKey 模式）
+$ tail -f /tmp/vpn-connect.log
+
+# 重新連接 screen（手動模式）
+$ screen -r vpn
+----
+
+==== 建立 Shell 別名（可選）
+
+[source,bash]
+----
+# 加入 ~/.bashrc
+cat >> ~/.bashrc << 'EOF'
+# VPN 快捷命令
+alias vpn-connect='bash ~/netbox-automation/scripts/connect-vpn.sh'
+alias vpn-status='bash ~/netbox-automation/scripts/show-vpn-status.sh'
+alias vpn-disconnect='bash ~/netbox-automation/scripts/disconnect-vpn.sh'
+EOF
+
+# 套用變更
+source ~/.bashrc
+
+# 使用
+$ vpn-connect
+$ vpn-status
+$ vpn-disconnect
+----
+
+== 完整故障排除指南
+
+=== 診斷流程圖
+
+[source]
+----
+VPN 連接失敗？
+  ↓
+├─ YubiKey 相關？
+│  ├─ YubiKey 未偵測 → 檢查 USB/pcscd/udev
+│  ├─ PIN 錯誤 → 檢查剩餘次數/重置
+│  └─ pass 失敗 → 檢查 gpg-agent/金鑰
+│
+├─ 網路相關？
+│  ├─ 無法連接伺服器 → 檢查防火牆/路由
+│  ├─ 驗證失敗 → 檢查帳號密碼/憑證
+│  └─ ppp0 未建立 → 檢查 openfortivpn 日誌
+│
+└─ 路由相關？
+   ├─ 企業網路不可達 → 檢查 set-routes
+   ├─ 本機網路中斷 → 檢查 half-internet-routes
+   └─ DNS 問題 → 檢查 pppd-use-peerdns
+----
+
+=== YubiKey 問題
+
+==== 問題：YubiKey 未被識別
+
+**症狀**：
+
+[source,bash]
+----
+$ gpg --card-status
+gpg: selecting card failed: No such device
+gpg: OpenPGP card not available: No such device
+----
+
+**診斷步驟**：
+
+[source,bash]
+----
+# 步驟 1: 檢查 USB 裝置
+$ lsusb | grep Yubico
+# 應顯示: Bus XXX Device XXX: ID 1050:0407 Yubico.com
+
+# 如果沒有輸出：
+#   • 檢查 YubiKey 是否正確插入
+#   • VMware：檢查 USB 控制器版本（應為 3.1）
+#   • VMware：檢查 USB 裝置是否連接到虛擬機
+
+# 步驟 2: 檢查 pcscd 服務
+$ systemctl status pcscd
+# 應顯示: Active: active (running)
+
+# 如果未運行：
+$ sudo systemctl start pcscd
+$ sudo systemctl enable pcscd
+
+# 步驟 3: 檢查 udev 規則
+$ cat /etc/udev/rules.d/70-yubikey.rules
+# 應包含: SUBSYSTEM=="usb", ATTRS{idVendor}=="1050" ...
+
+# 如果不存在或錯誤，重新建立規則
+$ sudo tee /etc/udev/rules.d/70-yubikey.rules << 'EOF'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0407", MODE="0666", GROUP="plugdev"
+EOF
+
+$ sudo udevadm control --reload-rules
+$ sudo udevadm trigger
+
+# 步驟 4: 檢查群組成員
+$ groups | grep plugdev
+# 應包含 plugdev
+
+# 如果不包含：
+$ sudo usermod -aG plugdev $USER
+# 需要登出再登入
+
+# 步驟 5: 重新啟動相關服務
+$ sudo systemctl restart pcscd
+$ gpg-connect-agent "SCD KILLSCD" "SCD BYE" /bye
+$ gpg-connect-agent reloadagent /bye
+
+# 步驟 6: 再次測試
+$ gpg --card-status
+----
+
+==== 問題：PIN 輸入逾時
+
+**症狀**：
+
+[source,bash]
+----
+$ pass show vpn/fortigate
+gpg: agent_get_passphrase failed: Timeout
+----
+
+**解決方案**：
+
+[source,bash]
+----
+# 修改 gpg-agent 設定
+$ cat >> ~/.gnupg/gpg-agent.conf << 'EOF'
+pinentry-timeout 120
+default-cache-ttl 600
+max-cache-ttl 7200
+EOF
+
+# 重新啟動 gpg-agent
+$ gpg-connect-agent reloadagent /bye
+
+# 再次測試
+$ pass show vpn/fortigate
+----
+
+==== 問題：PIN 錯誤次數過多
+
+**症狀**：
+
+[source,bash]
+----
+$ gpg --card-status | grep "PIN retry"
+PIN retry counter : 0 0 3
+                    ↑
+                  User PIN 已鎖定
+----
+
+**解決方案 1：使用 Admin PIN 解鎖**
+
+[source,bash]
+----
+$ gpg --card-edit
+
+gpg/card> admin
+Admin commands are allowed
+
+gpg/card> passwd
+
+1 - change PIN
+2 - unblock PIN      ← 選擇此項
+3 - change Admin PIN
+Q - quit
+
+Your selection? 2
+
+請輸入 Admin PIN
+Admin PIN: 12345678  ← 輸入 Admin PIN（或您修改後的）
+
+新的 PIN
+PIN: 123456  ← 設定新的 User PIN
+
+PIN changed.
+
+gpg/card> quit
+----
+
+**解決方案 2：Admin PIN 也鎖定時重置**
+
+[source,bash]
+----
+# 使用 ykman 重置（會清除所有金鑰！）
+$ ykman openpgp reset
+
+WARNING: This will delete all stored OpenPGP keys and data!
+[y/N]: y
+Resetting OpenPGP data...
+Success!
+
+# 從備份恢復金鑰
+$ gpg --import ~/yubikey-private-key-backup.asc
+$ gpg --edit-key <金鑰 ID>
+# 重新轉移金鑰到 YubiKey...
+----
+
+WARNING: 重置會刪除 YubiKey 上的所有金鑰，確保有備份！
+
+==== 問題：gpg-agent 快取不工作
+
+**症狀**：
+
+每次使用 `pass show` 都要求輸入 PIN，即使在快取時間內。
+
+**診斷**：
+
+[source,bash]
+----
+# 檢查 gpg-agent 是否運行
+$ pgrep gpg-agent
+# 應有 PID
+
+# 檢查設定檔
+$ cat ~/.gnupg/gpg-agent.conf
+default-cache-ttl 600     ← 應存在
+max-cache-ttl 7200        ← 應存在
+----
+
+**解決方案**：
+
+[source,bash]
+----
+# 確保設定正確
+$ cat > ~/.gnupg/gpg-agent.conf << 'EOF'
+default-cache-ttl 600
+max-cache-ttl 7200
+pinentry-timeout 120
+EOF
+
+# 殺掉舊的 gpg-agent
+$ gpgconf --kill gpg-agent
+
+# 下次使用時會自動啟動新的 agent
+$ pass show vpn/fortigate
+[輸入 PIN]
+
+# 10 分鐘內再次使用
+$ pass show vpn/fortigate
+[不需要 PIN] ✓
+----
+
+=== 網路與 VPN 問題
+
+==== 問題：無法連接 FortiGate 伺服器
+
+**症狀**：
+
+[source,bash]
+----
+$ bash ./connect-vpn.sh
+...
+✗ VPN 連接逾時
+
+$ tail /tmp/vpn-connect.log
+ERROR:  Cannot connect to gateway: Connection refused
+----
+
+**診斷步驟**：
+
+[source,bash]
+----
+# 步驟 1: 檢查網路連接
+$ ping 8.8.8.8
+# 確保有網路
+
+# 步驟 2: 檢查 FortiGate 伺服器可達性
+$ nc -zv 163.17.117.94 34401
+163.17.117.94 34401 (fortinet-sslvpn) open  ← 正常
+
+# 如果顯示 "Connection refused" 或 "Connection timed out"：
+#   • 伺服器可能離線
+#   • 防火牆阻擋
+#   • VPN 埠號錯誤
+
+# 步驟 3: 檢查設定檔
+$ grep -E "host|port" ~/netbox-automation/scripts/fortigate.conf
+host = 163.17.117.94
+port = 34401
+
+# 步驟 4: 測試 DNS 解析（如果使用域名）
+$ nslookup vpn.example.com
+# 確保可解析
+----
+
+==== 問題：VPN 驗證失敗
+
+**症狀**：
+
+[source,bash]
+----
+ERROR:  Gateway authentication failed.
+ERROR:  Gateway returned an error: Authentication failure
+----
+
+**可能原因**：
+
+1. 密碼錯誤
+2. 帳號被停用
+3. 伺服器要求額外認證（如 OTP）
+
+**解決方案**：
+
+[source,bash]
+----
+# 方案 1: 確認密碼正確
+$ pass show vpn/fortigate
+your_password  ← 確認是否正確
+
+# 方案 2: 手動測試連接
+$ screen -S vpn-test
+[screen 內] $ sudo openfortivpn -c ~/netbox-automation/scripts/fortigate.conf
+VPN account password: ________
+[查看詳細錯誤訊息]
+
+# 方案 3: 聯繫 IT 管理員
+# 確認帳號狀態、密碼政策變更、OTP 需求等
+----
+
+==== 問題：ppp0 介面未建立
+
+**症狀**：
+
+[source,bash]
+----
+$ bash ./connect-vpn.sh
+等待 VPN 介面建立...
+.....................
+✗ VPN 連接逾時
+
+$ ip addr show ppp0
+Device "ppp0" does not exist.
+----
+
+**診斷**：
+
+[source,bash]
+----
+# 查看 openfortivpn 日誌
+$ tail -50 /tmp/vpn-connect.log
+
+# 常見錯誤：
+# 1. "pppd: unrecognized option"
+#    → pppd 版本不相容
+#    → 解決：移除 fortigate.conf 中的不支援選項
+
+# 2. "pppd: failed to open /dev/ppp"
+#    → 沒有 ppp 核心模組
+#    → 解決：sudo modprobe ppp_generic
+
+# 3. "pppd: timeout"
+#    → 網路問題或伺服器問題
+#    → 解決：檢查網路、聯繫管理員
+----
+
+==== 問題：VPN 連接但無法存取企業網路
+
+**症狀**：
+
+[source,bash]
+----
+$ bash ./show-vpn-status.sh
+✓ VPN 已連接
+VPN IP: 10.212.134.100/32
+
+$ ping 163.17.38.238
+PING 163.17.38.238 (163.17.38.238) 56(84) bytes of data.
+--- 163.17.38.238 ping statistics ---
+5 packets transmitted, 0 received, 100% packet loss
+----
+
+**診斷步驟**：
+
+[source,bash]
+----
+# 步驟 1: 檢查路由表
+$ ip route show | grep ppp0
+# 應顯示多條路由
+
+# 如果沒有路由：
+$ grep set-routes ~/netbox-automation/scripts/fortigate.conf
+set-routes = 1  ← 必須為 1
+
+# 步驟 2: 檢查特定網段路由
+$ ip route get 163.17.38.238
+163.17.38.238 via ... dev ppp0 src 10.212.134.100  ← 正確
+# 或
+163.17.38.238 via 192.168.89.1 dev ens33 ...  ← 錯誤（走本機網路）
+
+# 步驟 3: 測試 VPN 閘道
+$ ping 10.212.134.1
+# 如果 VPN 閘道不可達 → 伺服器問題
+
+# 步驟 4: 測試 TCP 連接（ICMP 可能被禁止）
+$ nc -zv 163.17.38.238 22
+Connection to 163.17.38.238 22 port [tcp/ssh] succeeded!  ← 實際上可用
+
+# 步驟 5: 使用 traceroute
+$ traceroute 163.17.38.238
+1  10.212.134.1 (10.212.134.1)  ← 第一跳應是 VPN 閘道
+2  163.17.38.238 (163.17.38.238)
+----
+
+=== 腳本與權限問題
+
+==== 問題：sudo 在背景要求密碼
+
+**症狀**：
+
+[source,bash]
+----
+$ bash ./connect-vpn.sh
+使用 YubiKey 自動連接...
+等待 VPN 介面建立...
+.....................
+✗ VPN 連接逾時
+
+$ tail /tmp/vpn-connect.log
+[sudo] password for jojo: _____  ← 卡住
+----
+
+**原因**：
+
+sudo 快取過期，背景程序無法輸入密碼。
+
+**解決方案**：
+
+[source,bash]
+----
+# 腳本中已實作 sudo -v 預先驗證
+# 如果仍有問題，檢查腳本：
+
+$ grep "sudo -v" ~/netbox-automation/scripts/connect-vpn.sh
+sudo -v  ← 應存在
+
+# 如果問題持續，延長 sudo 快取時間
+$ sudo visudo
+# 加入：
+Defaults        timestamp_timeout=15  ← 15 分鐘（預設 5 分鐘）
+----
+
+==== 問題：臨時檔案殘留
+
+**症狀**：
+
+[source,bash]
+----
+$ ls /tmp/vpn-connect-wrapper.sh
+/tmp/vpn-connect-wrapper.sh  ← 應該被清理但還在
+----
+
+**原因**：
+
+腳本異常退出時 trap 未執行（極少見）。
+
+**解決方案**：
+
+[source,bash]
+----
+# 手動清理
+$ rm -f /tmp/vpn-connect-wrapper.sh
+
+# 檢查 trap 機制
+$ grep -A 3 "^trap" ~/netbox-automation/scripts/connect-vpn.sh
+trap cleanup EXIT INT TERM  ← 應存在
+
+# 如果需要，強化清理
+$ cat >> ~/.bashrc << 'EOF'
+# VPN 臨時檔案清理
+alias vpn-cleanup='rm -f /tmp/vpn-connect-wrapper.sh /tmp/vpn.pid /tmp/vpn-connect.log'
+EOF
+----
+
+=== pass 與 GPG 問題
+
+==== 問題：pass 找不到密碼儲存
+
+**症狀**：
+
+[source,bash]
+----
+$ pass show vpn/fortigate
+Error: vpn/fortigate is not in the password store.
+----
+
+**解決方案**：
+
+[source,bash]
+----
+# 檢查 pass 是否已初始化
+$ ls ~/.password-store/.gpg-id
+/home/jojo/.password-store/.gpg-id  ← 應存在
+
+# 如果不存在，初始化
+$ pass init <金鑰 ID>
+
+# 列出所有密碼
+$ pass ls
+Password Store
+└── vpn
+    └── fortigate  ← 應存在
+
+# 如果不存在，重新插入
+$ pass insert vpn/fortigate
+Enter password for vpn/fortigate: ________
+----
+
+==== 問題：GPG 解密失敗
+
+**症狀**：
+
+[source,bash]
+----
+$ pass show vpn/fortigate
+gpg: decryption failed: No secret key
+----
+
+**診斷**：
+
+[source,bash]
+----
+# 檢查私鑰
+$ gpg --list-secret-keys
+sec>  rsa4096/30B413E724701EA1 2026-01-31 [SC]
+      Card serial no. = 0006 34718416
+      ↑
+   必須有 ">" 符號（表示金鑰在卡片上）
+
+# 如果沒有 ">"：
+#   → 金鑰已被刪除
+#   → 需要重新匯入並轉移到 YubiKey
+
+# 檢查 YubiKey 上的金鑰
+$ gpg --card-status
+Encryption key ...: <fingerprint>  ← 應有指紋
+# 如果顯示 [none]：
+#   → 金鑰未在 YubiKey 上
+#   → 需要重新轉移
+----
+
+== 安全最佳實踐
+
+=== PIN 管理
+
+==== 修改預設 PIN
+
+WARNING: 預設 PIN 為眾所周知，必須修改！
+
+[source,bash]
+----
+$ gpg --card-edit
+
+gpg/card> admin
+gpg/card> passwd
+
+# 1. 修改 User PIN
+Your selection? 1
+PIN: 123456          ← 預設 User PIN
+新的 PIN: 987654     ← 設定強 PIN（建議 8 位）
+
+# 2. 修改 Admin PIN
+Your selection? 3
+Admin PIN: 12345678  ← 預設 Admin PIN
+新的 Admin PIN: 87654321  ← 設定強 Admin PIN
+
+gpg/card> quit
+----
+
+==== PIN 強度建議
+
+[cols="1,2,2"]
+|===
+| PIN 類型 | 最小長度 | 建議
+
+| User PIN
+| 6 位
+| 8+ 位，混合數字與特殊字元
+
+| Admin PIN
+| 8 位
+| 10+ 位，混合數字與特殊字元
+|===
+
+IMPORTANT: 兩個 YubiKey 建議使用相同的 PIN，方便切換。
+
+=== 備份管理
+
+==== 備份清單
+
+[cols="1,2,1,2"]
+|===
+| 檔案 | 內容 | 重要性 | 存放位置
+
+| yubikey-public-key.asc
+| GPG 公鑰
+| 中
+| Bitwarden + GitHub
+
+| yubikey-revoke-cert.rev
+| 註銷憑證
+| **極高**
+| Bitwarden + 加密 USB
+
+| yubikey-private-key-backup.asc
+| GPG 私鑰
+| 高
+| **轉移後銷毀**
+
+| fortigate.conf
+| VPN 設定
+| 低
+| Git repository
+|===
+
+==== 安全銷毀私鑰備份
+
+[source,bash]
+----
+# 確認兩個 YubiKey 都已轉移成功
+$ gpg --card-status  # 檢查第一個
+[更換 YubiKey]
+$ gpg --card-status  # 檢查第二個
+
+# 兩個都確認後，銷毀備份
+$ shred -vfz -n 10 ~/yubikey-private-key-backup.asc
+shred: ~/yubikey-private-key-backup.asc: pass 1/10 (random)...
+...
+shred: ~/yubikey-private-key-backup.asc: removed
+
+# 確認刪除
+$ ls ~/yubikey-private-key-backup.asc
+ls: cannot access ...: No such file or directory  ✓
+----
+
+=== 系統安全
+
+==== 防止密碼記錄在歷史
+
+[source,bash]
+----
+# ~/.bashrc 中設定
+cat >> ~/.bashrc << 'EOF'
+# 防止敏感命令記錄
+HISTIGNORE='pass*:*password*:*passwd*'
+EOF
+
+source ~/.bashrc
+----
+
+==== 限制 VPN 日誌權限
+
+[source,bash]
+----
+# 設定日誌檔案權限
+$ chmod 600 /tmp/vpn-connect.log
+
+# 或使用 tmpfs（重啟自動清除）
+$ grep /tmp /etc/fstab
+tmpfs /tmp tmpfs defaults,noatime,mode=1777 0 0
+----
+
+==== 定期審計
+
+[source,bash]
+----
+# 檢查 GPG 金鑰狀態
+$ gpg --card-status
+$ gpg --list-secret-keys
+
+# 檢查 pass 儲存
+$ pass ls
+
+# 檢查 VPN 連接記錄
+$ journalctl -u pcscd --since "1 week ago"
+
+# 檢查 YubiKey 使用次數
+$ gpg --card-status | grep "Signature counter"
+Signature counter : 42  ← 簽署/解密次數
+----
+
+=== 遺失 YubiKey 的應變
+
+==== 應變計畫
+
+[source]
+----
+情境 1: YubiKey 遺失，有第二個 YubiKey
+  1. 使用第二個 YubiKey 繼續工作 ✓
+  2. 訂購新的 YubiKey
+  3. 從備份恢復私鑰到新 YubiKey
+  4. （可選）註銷舊金鑰（如果擔心被盜用）
+
+情境 2: 兩個 YubiKey 都遺失，有私鑰備份
+  1. 從備份恢復私鑰到本機
+  2. 使用本機私鑰（暫時）
+  3. 訂購新的 YubiKey
+  4. 轉移金鑰到新 YubiKey
+  5. 銷毀本機私鑰
+
+情境 3: YubiKey 和備份都遺失
+  1. 使用註銷憑證註銷金鑰
+  2. 產生新的 GPG 金鑰對
+  3. 重新設置整個系統
+  4. 重新加密 pass 儲存
+  5. 轉移到新 YubiKey
+
+情境 4: 懷疑 YubiKey 被盜
+  1. 立即註銷金鑰
+  2. 更改所有相關密碼
+  3. 產生新的金鑰對
+  4. 通知 IT 管理員
+----
+
+==== 註銷金鑰程序
+
+[source,bash]
+----
+# 匯入註銷憑證
+$ gpg --import ~/yubikey-revoke-cert.rev
+gpg: key 30B413E724701EA1: "YubiKey User" revocation certificate imported
+
+# 發布到公鑰伺服器
+$ gpg --send-keys 30B413E724701EA1
+
+# 或匯出已註銷的公鑰
+$ gpg --export --armor 30B413E724701EA1 > revoked-key.asc
+# 手動上傳到 Bitwarden、通知相關人員
+----
+
+== 效能調校
+
+=== GPG Agent 快取調整
+
+==== 調整快取時間
+
+[source,bash]
+----
+$ vi ~/.gnupg/gpg-agent.conf
+
+# 根據使用習慣調整
+default-cache-ttl 1800     # 30 分鐘（預設 600 = 10 分鐘）
+max-cache-ttl 28800        # 8 小時（預設 7200 = 2 小時）
+
+# 重新載入
+$ gpg-connect-agent reloadagent /bye
+----
+
+權衡考量：
+
+* **快取時間長**：方便使用，但離開座位時風險較高
+* **快取時間短**：更安全，但頻繁輸入 PIN
+
+==== 自動清除快取（離開座位時）
+
+[source,bash]
+----
+# 建立清除腳本
+$ cat > ~/bin/lock-gpg << 'EOF'
+#!/bin/bash
+gpg-connect-agent reloadagent /bye
+gpgconf --kill gpg-agent
+notify-send "GPG Agent" "快取已清除"
+EOF
+
+$ chmod +x ~/bin/lock-gpg
+
+# 綁定到鎖定螢幕快捷鍵
+# 或加入 ~/.xsessionrc：
+# xset s on
+# xss-lock -- ~/bin/lock-gpg
+----
+
+=== VPN 連接速度
+
+==== 減少等待時間
+
+[source,bash]
+----
+# 修改 connect-vpn.sh 中的等待迴圈
+# 從 60 秒改為 30 秒（如果伺服器快）
+
+for i in {1..30}; do  # 原本是 {1..60}
+    if ip addr show ppp0 &>/dev/null 2>&1; then
+        ...
+    fi
+done
+----
+
+==== 連接狀態快取
+
+[source,bash]
+----
+# 儲存連接狀態到檔案
+$ cat > ~/.vpn-status << 'EOF'
+CONNECTED=1
+VPN_IP=10.212.134.100/32
+CONNECTED_AT=$(date +%s)
+EOF
+
+# show-vpn-status.sh 可快速讀取
+# 減少重複的 ip addr show 呼叫
+----
+
+=== 自動化程度提升
+
+==== 定期 VPN 連接（crontab）
+
+[source,bash]
+----
+# 每天早上 8 點自動連接 VPN（需 YubiKey 模式）
+$ crontab -e
+0 8 * * 1-5 bash /home/jojo/netbox-automation/scripts/connect-vpn.sh
+
+# 每天晚上 6 點自動中斷
+0 18 * * 1-5 bash /home/jojo/netbox-automation/scripts/disconnect-vpn.sh
+----
+
+WARNING: crontab 執行時無法輸入 YubiKey PIN，需確保 PIN 快取時間足夠長。
+
+==== 網路變化時自動重連
+
+[source,bash]
+----
+# 使用 NetworkManager dispatcher
+$ sudo tee /etc/NetworkManager/dispatcher.d/90-vpn-reconnect << 'EOF'
+#!/bin/bash
+
+INTERFACE=$1
+STATUS=$2
+
+if [ "$STATUS" = "up" ]; then
+    # 網路恢復時重新連接 VPN
+    if [ -f /tmp/vpn.pid ]; then
+        /home/jojo/netbox-automation/scripts/disconnect-vpn.sh
+        sleep 2
+        /home/jojo/netbox-automation/scripts/connect-vpn.sh
+    fi
+fi
+EOF
+
+$ sudo chmod +x /etc/NetworkManager/dispatcher.d/90-vpn-reconnect
+----
+
+== 系統維護
+
+=== 定期維護清單
+
+==== 每週
+
+- [ ] 檢查 VPN 日誌是否有異常
+- [ ] 測試第二個 YubiKey 是否正常
+- [ ] 清理臨時檔案
+
+[source,bash]
+----
+# 清理臨時檔案
+$ rm -f /tmp/vpn-*.log /tmp/vpn.pid /tmp/screen*.log
+----
+
+==== 每月
+
+- [ ] 檢查 GPG 金鑰有效期
+- [ ] 驗證備份檔案完整性
+- [ ] 更新系統套件
+
+[source,bash]
+----
+# 檢查金鑰
+$ gpg --list-keys 30B413E724701EA1
+
+# 更新系統
+$ sudo apt update
+$ sudo apt upgrade gpg pass openfortivpn pcscd
+----
+
+==== 每季
+
+- [ ] 測試從備份恢復流程
+- [ ] 審查安全設定
+- [ ] 更新文件
+
+=== 日誌管理
+
+==== 日誌輪替
+
+[source,bash]
+----
+# 建立 logrotate 設定
+$ sudo tee /etc/logrotate.d/vpn << 'EOF'
+/tmp/vpn-connect.log {
+    size 10M
+    rotate 5
+    compress
+    missingok
+    notifempty
+}
+EOF
+----
+
+==== 日誌分析
+
+[source,bash]
+----
+# 統計連接次數
+$ grep "VPN 連接完成" /tmp/vpn-connect.log | wc -l
+
+# 查找錯誤
+$ grep -i "error\|failed" /tmp/vpn-connect.log
+
+# 分析連接時間
+$ grep "VPN IP:" /tmp/vpn-connect.log | \
+  awk '{print $1, $2}' | \
+  xargs -I {} date -d "{}" +%H:%M
+----
+
+=== 升級與遷移
+
+==== 升級 GPG
+
+[source,bash]
+----
+# 備份設定
+$ cp -r ~/.gnupg ~/.gnupg.backup
+
+# 升級套件
+$ sudo apt update
+$ sudo apt upgrade gpg
+
+# 測試
+$ gpg --version
+$ gpg --card-status
+$ pass show vpn/fortigate
+----
+
+==== 遷移到新機器
+
+[source,bash]
+----
+# 舊機器：
+# 1. 確保金鑰在 YubiKey 上（不在本機）
+$ gpg --list-secret-keys
+sec>  rsa4096/30B413E724701EA1  ← 有 ">" 符號 ✓
+
+# 2. 匯出公鑰
+$ gpg --export --armor 30B413E724701EA1 > public-key.asc
+
+# 3. 備份 pass 儲存
+$ tar czf password-store.tar.gz ~/.password-store
+
+# 新機器：
+# 1. 安裝套件
+$ sudo apt install gpg pass pcscd openfortivpn screen
+
+# 2. 匯入公鑰
+$ gpg --import public-key.asc
+
+# 3. 恢復 pass 儲存
+$ tar xzf password-store.tar.gz -C ~/
+
+# 4. 插入 YubiKey
+$ gpg --card-status
+
+# 5. 測試
+$ pass show vpn/fortigate  ✓
+
+# 6. 複製腳本
+$ git clone ... ~/netbox-automation
+----
+
+== 附錄
+
+=== 常用命令速查表
+
+[cols="2,3"]
+|===
+| 命令 | 功能
+
+| *VPN 操作*
+|
+
+| `bash ./connect-vpn.sh`
+| 連接 VPN（自動偵測 YubiKey）
+
+| `bash ./disconnect-vpn.sh`
+| 中斷 VPN
+
+| `bash ./show-vpn-status.sh`
+| 顯示 VPN 狀態
+
+| `tail -f /tmp/vpn-connect.log`
+| 查看即時日誌
+
+| *YubiKey 操作*
+|
+
+| `gpg --card-status`
+| 檢查 YubiKey 狀態
+
+| `gpg --card-edit`
+| 編輯 YubiKey 設定
+
+| `ykman openpgp info`
+| 顯示 OpenPGP 應用程式資訊
+
+| `ykman openpgp reset`
+| 重置 OpenPGP 應用程式
+
+| *pass 操作*
+|
+
+| `pass ls`
+| 列出所有密碼
+
+| `pass show vpn/fortigate`
+| 顯示 VPN 密碼
+
+| `pass insert vpn/fortigate`
+| 儲存 VPN 密碼
+
+| `pass edit vpn/fortigate`
+| 編輯 VPN 密碼
+
+| *GPG 操作*
+|
+
+| `gpg --list-keys`
+| 列出公鑰
+
+| `gpg --list-secret-keys`
+| 列出私鑰
+
+| `gpg --export --armor <ID>`
+| 匯出公鑰
+
+| `gpg --import <file>`
+| 匯入金鑰
+
+| `gpg-connect-agent reloadagent /bye`
+| 重新載入 gpg-agent
+
+| *screen 操作*
+|
+
+| `screen -S vpn`
+| 建立名為 vpn 的會話
+
+| `screen -list`
+| 列出所有會話
+
+| `screen -r vpn`
+| 重新連接 vpn 會話
+
+| `screen -S vpn -X quit`
+| 終止 vpn 會話
+
+| `Ctrl+A D`
+| 離開會話（detach）
+
+| *網路診斷*
+|
+
+| `ip addr show ppp0`
+| 顯示 VPN 介面資訊
+
+| `ip route show`
+| 顯示路由表
+
+| `ping <IP>`
+| 測試連接
+
+| `nc -zv <IP> <port>`
+| 測試 TCP 埠
+
+| `traceroute <IP>`
+| 追蹤路由路徑
+|===
+
+=== 錯誤碼參考
+
+[cols="1,2,2"]
+|===
+| 錯誤碼 | 意義 | 解決方案
+
+| GPG 2
+| 錯誤（金鑰不存在等）
+| 檢查金鑰是否存在、YubiKey 是否插入
+
+| GPG 1
+| 一般錯誤
+| 查看詳細錯誤訊息
+
+| EXIT 1
+| 腳本執行失敗
+| 查看腳本輸出
+
+| EXIT 127
+| 命令找不到
+| 檢查套件是否安裝
+|===
+
+=== 環境變數
+
+[cols="1,3"]
+|===
+| 變數 | 說明
+
+| `GNUPGHOME`
+| GPG 設定目錄（預設 ~/.gnupg）
+
+| `PASSWORD_STORE_DIR`
+| pass 儲存目錄（預設 ~/.password-store）
+
+| `GPG_TTY`
+| GPG pinentry 使用的 TTY
+
+| `SCRIPT_DIR`
+| 腳本所在目錄（connect-vpn.sh 中）
+|===
+
+=== 相關資源
+
+==== 官方文件
+
+* https://gnupg.org/documentation/[GnuPG Documentation]
+* https://www.passwordstore.org/[pass - The Standard Unix Password Manager]
+* https://developers.yubico.com/PGP/[Yubico OpenPGP Documentation]
+* https://github.com/adrienverge/openfortivpn[openfortivpn GitHub]
+
+==== 社群資源
+
+* https://github.com/drduh/YubiKey-Guide[drduh's YubiKey Guide]
+* https://wiki.archlinux.org/title/GnuPG[Arch Linux GnuPG Wiki]
+* https://github.com/FiloSottile/passage[passage - GPG-free fork of pass]
+
+== 結語
+
+本文件系列記錄了一個完整的企業級 VPN 自動化系統的開發過程，從 OpenPGP 加密原理到 YubiKey 硬體整合，再到智能的雙模式 VPN 連接方案。
+
+=== 關鍵成就
+
+1. **硬體級安全**：私鑰永不離開 YubiKey
+2. **智能自動化**：自動偵測 YubiKey，無縫切換模式
+3. **企業級功能**：Server-pushed routes、Split tunneling
+4. **完整容錯**：雙 YubiKey 備份、手動模式後援
+5. **友善體驗**：清楚的使用者指引、完整的錯誤處理
+
+=== 適用場景
+
+本系統特別適合：
+
+* 需要頻繁連接企業 VPN 的遠端工作者
+* 重視密碼安全的技術人員
+* 需要自動化 VPN 連接的 DevOps 流程
+* 學習 OpenPGP 和智能卡整合的開發者
+
+=== 持續改進
+
+未來可能的改進方向：
+
+* GUI 介面（使用 zenity 或 yad）
+* 多 VPN 設定管理
+* 連接狀態桌面通知
+* 與 systemd 整合
+* 支援其他 VPN 協定（OpenVPN、WireGuard）
+
+感謝您閱讀本文件系列，希望對您的專案有所幫助！
+
+---
+
+link:04-manual-mode.adoc[← 上一章：手動輸入模式] | link:00-overview.adoc[返回總覽]
+
+---
+
+*文件版本*: 1.0 +
+*最後更新*: 2026-02-01 +
+*作者*: YubiKey + OpenPGP + VPN 自動化專案
